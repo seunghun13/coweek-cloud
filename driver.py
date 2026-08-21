@@ -1053,6 +1053,35 @@ class CoweekDriver(Node):
                 speed = 0.0
             elif age > STALE_SLOW:
                 speed = min(speed, STALE_SLOW_V)
+        # ── v70: 계측 전용. 계산에 일절 영향이 없다 ──
+        # tick() 은 이번 틱의 판단 근거(aim/mode/carea/fmin/dodging/checker)를
+        # 전부 **지역변수**로 들고 있어서, 밖에서는 "speed 를 만든 상한이
+        # 무엇인지" 를 알 방법이 없다. 잔차 정책이 같은 0.45 를 보고도
+        # 콘 회피인지 결승 밴드인지 구분하지 못하면 같은 행동을 내게 된다.
+        # 그래서 여기서 한 번만 self 에 복사해 둔다.
+        #
+        # 이 dict 는 driver.py 안에서 **아무도 읽지 않는다**. 순수 대입이라
+        # 주행 동작은 비트 단위로 동일하다 (예선 3런·score_now 로 검증).
+        # 초록불 이전에는 아래 이름들이 아직 없으므로 locals() 로 방어한다.
+        _lv = locals()
+        self.last_tick = {
+            'ticks': self.ticks,
+            'green': self.green_latched,
+            'speed': float(speed), 'steer': float(steer),
+            'aim': float(aim), 'mode': mode, 'carea': float(carea),
+            'fmin': float(_lv.get('fmin', LID_RANGE_MAX)),
+            'lbias': float(_lv.get('lbias', 0.0)),
+            'dodging': bool(_lv.get('dodging', False)),
+            'sharp': bool(_lv.get('sharp', False)),
+            'crawl': bool(_lv.get('crawl', False)),
+            'checker': _lv.get('checker_d', None) is not None,
+            'arc_safe': float(self.arc_safe),
+            'pass_hold': int(self.pass_hold),
+            'pass_side': float(self.pass_side),
+            'ncone': len(self.cone_list),
+            'band_px': int(self.band_px),
+            'frame_t': self.frame_t,
+        }
         self.pub_speed.publish(Float64(data=float(speed)))
         self.pub_steer.publish(Float64(data=float(steer)))
         self.pub_tilt.publish(Float64(data=CAM_TILT))
