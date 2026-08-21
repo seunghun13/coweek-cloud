@@ -20,13 +20,13 @@ residual=0 이면 **정확히 racer-v64** 다. 실차에서 이상하면 잔차�
   1순위 병목(결승선 놓침, 1회 ≈ 50초)이 이제 학습에 존재한다.
 - **완주 = terminated** (P0-2): 목표 달성 종료라 SB3 가 부트스트랩하지
   않는다. 150 초 안전망만 truncated 다.
-- **보상 = 공식 비용 그대로** (P0-6):
-      r = -W · (Δt + 5·I_off + 5·I_cone)
-  진행 보상·배리어·스무딩 항은 전부 뺐다. K_PROG 논증은 할인 때문에
-  성립하지 않았고(어떤 스칼라도 Σγᵗ·Δs 를 상수로 못 만든다), 결승선 놓침을
-  모델링하는 순간 raw 진행 보상은 "추가 한 바퀴 30.5 m = 30.5 초 이득"으로
-  실제 50 초 하방을 상쇄해 버린다. Δt 는 페널티 회복에 쓴 추가 틱까지 센다
-  (심판의 시계는 그동안에도 돈다).
+- **보상 = 공식 비용 + potential 진행 정형** (P0-6 → 사이클 2 v2_pbrs):
+      r = -W·(Δt + 5·n_off + 5·n_cone)  +  K_POT·(γ·Φ(s') − Φ(s)),  Φ = lap_s
+  raw K_PROG 는 기각된 채다(할인 비상수·결승 놓침 상쇄 — P0-6). PBRS 는
+  Ng 정리로 **최적 정책 불변**이라 그 기각 사유를 피해가면서, "시간 비용은
+  행동과 무관해 Q 의 행동 기울기가 부트스트랩으로만 생긴다"는 사이클 1 의
+  실측 문제(정책이 관측 잡음을 따라 널뜀)를 고친다. γ 는 학습 gamma 와
+  같아야 하며 train_speed 가 넘겨준다. Δt 는 페널티 회복 틱까지 센다.
 - **보상용 상태는 항상 새 상태** (P0-3): `/state` 폴에 seq 를 매기고, 행동
   발행 이전 seq 의 상태는 쓰지 않는다. 폴 실패·vehicle 누락은 (0,0,0) 으로
   대체하지 않고 세며, 새 상태가 제때 안 오면 **크게 죽는다** — 낡은 상태로
@@ -102,11 +102,25 @@ SPAWN_CONE_CLEAR = 0.35    # 리셋 스폰이 콘 위에 떨어지지 않게
 STATE_JSON = ('/mnt/c/Users/정승훈/Desktop/coweek/자율주행 해커톤 정보/'
               '시뮬레이터 자료/api-dumps-AMET2026/state.json')
 
-# ── 보상 계수 (`official_cost_v1`) ──
-W_SCALE = 0.1
+# ── 보상 계수 (`official_cost_v2_pbrs`) ──
+# W_SCALE 0.1 → 1.0 (사이클 2, 2026-08-22): 스텝당 보상이 −0.005 수준이라
+# Q 의 행동 방향 기울기가 함수근사 잡음에 묻혔다. 실측 증상: s7 정책이
+# fmin·aim·carea 에 비단조로 널뛰고(aim 부호만 바꿔도 잔차가 ±0.35 반전),
+# 자기 학습 분포에서조차 잔차 0 보다 +8.9 초 느렸다.
+W_SCALE = 1.0
 P_OFF = 5.0
 P_CONE = 5.0
-# K_PROG / 배리어 / 스무딩 계수는 전수검수 P0-6 으로 제거됐다 (모듈 독스트링).
+# Potential 기반 진행 정형 (사이클 2). 시간 비용은 행동과 **무관**해서
+# (어떤 행동을 내든 그 스텝 −DT) Q 의 행동 기울기가 부트스트랩으로만 생기는데,
+# 그 신호가 너무 약했다. Φ(s) = K_POT·lap_s 로 두면
+#     F = γ·Φ(s') − Φ(s) ≈ K_POT·ds     (γ≈1)
+# 가 행동에 즉각 반응한다. **Ng 정리에 의해 최적 정책 불변** — raw K_PROG 가
+# 기각된 이유(할인 비상수·결승 놓침 상쇄)는 γ-보정 텔레스코핑이 정확히 막는다:
+# 놓침으로 한 바퀴를 더 돌면 Φ 가 30.5 오르지만 그 사이 할인·시간 비용이
+# 정확히 그 이상을 가져간다. γ 는 학습 gamma 와 **반드시 같아야** 한다
+# (env 인자 gamma — train_speed 가 자기 gamma 를 넘긴다).
+K_POT = 1.0
+# K_PROG(raw) / 배리어 / 스무딩은 전수검수 P0-6 으로 제거된 채 유지.
 
 # ── 에피소드 ──
 DT = 1.0 / drv.RATE_HZ     # 0.05 s
@@ -132,7 +146,8 @@ HIST = 3
 
 # 계약 버전 — 모델 매니페스트와 평가기가 대조한다. 종료·보상·관측의 의미가
 # 바뀌면 반드시 올릴 것 (기존 모델·버퍼가 조용히 오작동하는 것을 막는다).
-CONTRACT = 'official_cost_v1+referee_finish_v1'
+# v2_pbrs: W_SCALE 1.0 + potential 진행 정형 (s7 까지의 v1 모델은 재사용 불가)
+CONTRACT = 'official_cost_v2_pbrs+referee_finish_v1'
 
 
 # 시뮬이 스스로 푸는 일시적 409 (referee.py 와 같은 목록). "already running"
@@ -652,7 +667,7 @@ class CoweekResidualEnv(gym.Env):
                  start_lo=0, start_hi=None, log=None, dyn=True, dyn_ranges=None,
                  cone_reshuffle=1, cone_pin=('cone6',),
                  lap_episode=True, max_episode_s=180.0,   # = referee.TIME_LIMIT
-                 start_at_line=True):
+                 start_at_line=True, gamma=0.9995, ep_csv=None):
         super().__init__()
         self.rng = np.random.default_rng(seed)
         self.track = Track()
@@ -671,6 +686,20 @@ class CoweekResidualEnv(gym.Env):
         self.start_lo = start_lo
         self.start_hi = start_hi if start_hi is not None else len(self.track.wp) - 1
         self.log = log
+        # PBRS 의 γ. **학습 gamma 와 같아야** Ng 정리의 정책 불변이 성립한다
+        # (train_speed 가 자기 --gamma 를 그대로 넘긴다)
+        self.gamma = float(gamma)
+        # 에피소드 요약 CSV (진행 추세용 — 정형이 섞인 return 으로는 페널티를
+        # 역산할 수 없게 됐으므로 원자료를 직접 남긴다)
+        self.ep_csv = ep_csv
+        if ep_csv:
+            with open(ep_csv, 'a') as f:
+                if f.tell() == 0:
+                    f.write('t_s,off,hit,lap_done,timeout,ret_official,ret_shape\n')
+        self._ep_off = 0
+        self._ep_hit = 0
+        self._ep_r_off = 0.0
+        self._ep_r_shape = 0.0
 
         # 동역학 도메인 랜덤화. 에피소드마다 플랜트를 다시 뽑는다.
         # 끄면(dyn=False) 명령이 한 비트도 안 바뀐다 — 그게 참 플랜트다.
@@ -917,9 +946,13 @@ class CoweekResidualEnv(gym.Env):
         p = self._fresh_pose(time.monotonic())
         _, s, e, half = self.track.locate(p[0], p[1])
         self._s_prev = s
-        self._lap_s = 0.0          # 진단값 (종료 판정에는 쓰지 않는다 — P0-1)
+        self._lap_s = 0.0          # 진행 potential Φ 의 원료 (종료 판정 아님 — P0-1)
         self._time_s = 0.0         # 공식 비용에 넣은 누적 시간
         self._t = 0
+        self._ep_off = 0
+        self._ep_hit = 0
+        self._ep_r_off = 0.0
+        self._ep_r_shape = 0.0
         return self._stack(self._obs_row(lt)), {'dyn': plant, 'reshuffled': n_shuf}
 
     def step(self, action):
@@ -994,6 +1027,7 @@ class CoweekResidualEnv(gym.Env):
         # 순서를 바꿔 봤더니 정상 주행분이 통째로 버려져 한 바퀴가 30.50 이
         # 아니라 **27.06** 으로 모자랐다 (`test_env_dyn` G2 가 즉시 잡았다).
         # 리뷰 발견이라도 측정으로 확인하기 전에는 반영하지 않는다.
+        lap_s_before = self._lap_s      # PBRS 의 Φ(old) — 갱신 전에 잡는다
         self._lap_s += min(max(ds, -0.5), 0.5)
         # 보상·진단용 ds 는 여기서 죽인다 — 순간이동 착취 차단
         if off or hit or abs(ds) > 0.25:
@@ -1031,14 +1065,23 @@ class CoweekResidualEnv(gym.Env):
             s = s2
             teleported = True
 
-        # ── 보상 = 공식 비용 그대로 (P0-6). 정형·배리어 없음.
+        # ── 보상 = 공식 비용 + potential 진행 정형 (`official_cost_v2_pbrs`).
         # ⚠️ 콘은 **개수만큼** 과금한다 — 심판은 콘마다 +5 를 주므로(콘 루프
         # 안에서 `penalty += 5`), 한 틱에 두 개를 치면 심판은 +10 이다.
         # `bool(hit)` 로 세면 그 차이만큼 정책이 무벌로 배운다 (전수검수 P2-5).
         step_t = DT * (1 + extra)
         self._time_s += step_t
         cost = step_t + P_OFF * off + P_CONE * len(fresh)
-        reward = -W_SCALE * cost
+        r_official = -W_SCALE * cost
+        # PBRS: F = γ·Φ(new) − Φ(old), Φ = K_POT·lap_s. 정확히 이 꼴이어야
+        # (γ 는 학습 gamma) 최적 정책이 불변이다 — γ 를 1 로 근사하면 raw
+        # K_PROG 로 퇴화해 결승 놓침의 추가 랩이 보상으로 상쇄된다 (P0-6).
+        r_shape = K_POT * (self.gamma * self._lap_s - lap_s_before)
+        reward = r_official + r_shape
+        self._ep_off += int(off)
+        self._ep_hit += len(fresh)
+        self._ep_r_off += r_official
+        self._ep_r_shape += r_shape
 
         self._s_prev = s
         self._prev_a = a
@@ -1068,9 +1111,21 @@ class CoweekResidualEnv(gym.Env):
                 'cmd': cmd, 'cmd_out': cmd_out, 'res': res, 'e': e,
                 'lap_s': self._lap_s, 'lap_done': bool(lap_done),
                 'timeout': bool(timeout), 't_s': self._time_s,
-                'extra_ticks': extra, 'adv': self.finish.adv}
+                'extra_ticks': extra, 'adv': self.finish.adv,
+                'r_official': r_official, 'r_shape': r_shape}
         if self.log is not None:
             self.log.append(info)
+        if (terminated or truncated) and self.ep_csv:
+            # 진행 추세의 원자료 — 정형이 섞인 return 으로는 페널티를 역산할
+            # 수 없다 (train_progress.py 가 이 파일을 읽는다)
+            try:
+                with open(self.ep_csv, 'a') as f:
+                    f.write('%.2f,%d,%d,%d,%d,%.3f,%.3f\n'
+                            % (self._time_s, self._ep_off, self._ep_hit,
+                               int(lap_done), int(timeout),
+                               self._ep_r_off, self._ep_r_shape))
+            except OSError:
+                pass
         return obs, float(reward), terminated, truncated, info
 
     def close(self):

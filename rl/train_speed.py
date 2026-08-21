@@ -81,6 +81,7 @@ def write_manifest(out, args, status):
     import stable_baselines3 as sb3
     m = {'status': status,                       # READY / INCOMPLETE
          'contract': ce.CONTRACT,
+         'w_scale': ce.W_SCALE, 'k_pot': ce.K_POT,
          'git_commit': commit,
          'driver_md5': _md5('coweek/driver.py'),
          # arc_planner 도 관측 의미의 일부다 (aim·arc_safe·mode 가 그쪽 산물)
@@ -196,7 +197,10 @@ def main():
                                     cone_pin=pin,
                                     lap_episode=not a.no_lap,
                                     max_episode_s=a.max_episode_s,
-                                    start_at_line=not a.start_anywhere),
+                                    start_at_line=not a.start_anywhere,
+                                    # PBRS 의 γ = 학습 γ (다르면 정책 불변이 깨진다)
+                                    gamma=a.gamma,
+                                    ep_csv=os.path.join(a.out, 'episodes.csv')),
                   filename=os.path.join(a.out, 'monitor.csv'))
     print('에피소드: %s · 시작 %s'
           % ('한 바퀴 (안전망 %.0f 초)' % a.max_episode_s if not a.no_lap

@@ -44,7 +44,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--unit', action='store_true', help='시뮬 없는 부분만')
 args = ap.parse_args()
 
-from coweek_env import (Track, FinishDetector, W_SCALE, DT,  # noqa: E402
+from coweek_env import (Track, FinishDetector, W_SCALE, K_POT, DT,  # noqa: E402
                         CoweekResidualEnv)
 import eval_policy as ep                                      # noqa: E402
 
@@ -361,14 +361,20 @@ print('\n=== S  시뮬 계약 (약 2분) ===', flush=True)
 ZERO = np.zeros(1, np.float32)
 env = CoweekResidualEnv(seed=21, dyn=False, cone_reshuffle=0)
 
-# S1: 완주 = terminated (P0-2) + 보상 합 = 공식 비용 (P0-6, GPT Test 12)
+# S1: 완주 = terminated (P0-2) + 보상 대사 (P0-6 + v2_pbrs, GPT Test 12)
 obs, _ = env.reset()
-tot_r, offs, hits, steps = 0.0, 0, 0, 0
+tot_r, tot_off_r, tot_shape, offs, hits, steps = 0.0, 0.0, 0.0, 0, 0, 0
+exp_shape, prev_lap = 0.0, 0.0
 term = trunc = False
 info = {}
 while not (term or trunc):
     obs, r, term, trunc, info = env.step(ZERO)
     tot_r += r
+    tot_off_r += info['r_official']
+    tot_shape += info['r_shape']
+    # PBRS 텔레스코핑을 info['lap_s'] 로 독립 재구성해 대조한다
+    exp_shape += K_POT * (env.gamma * info['lap_s'] - prev_lap)
+    prev_lap = info['lap_s']
     offs += int(info['off'])
     hits += int(info['n_hit'])     # 심판처럼 **콘 개수**로 센다 (P2-5)
     steps += 1
@@ -376,9 +382,17 @@ check('S1 완주 = terminated', term and info['lap_done'],
       'steps=%d t_s=%.1f adv=%d' % (steps, info['t_s'], info['adv']))
 check('S1b 완주는 truncated 가 아니다', not trunc)
 official = info['t_s'] + 5.0 * (offs + hits)
-recon = abs(-tot_r / W_SCALE - official)
-check('S1c 보상 합 = -(공식 비용) (Test 12)', recon < 1e-6,
-      '|Σr/W + cost| = %.2e (cost %.2f)' % (recon, official))
+recon = abs(-tot_off_r / W_SCALE - official)
+check('S1c 공식 비용 항 = -(t_s + 5N) (Test 12)', recon < 1e-6,
+      '|Σr_off/W + cost| = %.2e (cost %.2f)' % (recon, official))
+check('S1c2 보상 = 공식 항 + 정형 항 (분해 정확)',
+      abs(tot_r - (tot_off_r + tot_shape)) < 1e-9)
+check('S1c3 정형 항 = PBRS 텔레스코핑 (독립 재구성 일치)',
+      abs(tot_shape - exp_shape) < 1e-6,
+      'Σr_shape %.4f vs 재구성 %.4f' % (tot_shape, exp_shape))
+check('S1c4 정형 총합이 Φ(종점) 이하 (공짜 보상 없음)',
+      tot_shape <= K_POT * info['lap_s'] + 1e-6,
+      '%.3f <= %.3f' % (tot_shape, K_POT * info['lap_s']))
 check('S1d 랩 시간이 그럴듯하다', 30.0 <= info['t_s'] <= 120.0,
       't_s %.1f' % info['t_s'])
 

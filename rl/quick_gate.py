@@ -90,9 +90,10 @@ def main():
                             cone_reshuffle=a.cone_reshuffle)
     model = SAC.load(a.model, device='cpu')
     seeds = [a.seed0 + k for k in range(a.episodes)]
-    print('짝지은 %d 쌍 · 동역학 랜덤화 %s · 콘 재배치 %s (pin 없음 = 본선 분포)'
+    print('짝지은 %d 쌍 · 동역학 랜덤화 %s · 콘 재배치 %s (pin=%s)'
           % (a.episodes, 'ON' if a.dyn else 'OFF (참 플랜트)',
-             ('%d 랩마다' % a.cone_reshuffle) if a.cone_reshuffle else 'OFF'),
+             ('%d 랩마다' % a.cone_reshuffle) if a.cone_reshuffle else 'OFF',
+             ','.join(env.cones.pin) or '없음'),
           flush=True)
     pairs = []
     try:
