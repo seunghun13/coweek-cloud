@@ -121,6 +121,10 @@ RES_MAX = 0.35             # 속도 잔차 범위 [-RES_MAX, +RES_MAX] (대칭)
 #   SAC 초기 정책이 0 근처이므로 학습 시작점이 검증된 베이스와 같고,
 #   zero residual 이 v64 를 재현하는지 그대로 검증할 수 있다.
 V_HARD = 1.40              # 안전 상한. 정책이 이 위로 못 간다
+# 프레임이 이보다 낡으면 **학습·배포 모두** 잔차를 0 으로 강제한다.
+# `driver.STALE_SLOW` 와 같은 문턱이고, `run_policy.py` 가 이 값을 import 한다
+# — 두 곳에 따로 적어 두면 조용히 어긋난다.
+STALE_NO_RESIDUAL = 0.35
 
 CAP_NAMES = ('vmax', 'alat', 'cone_slow', 'cone_near', 'arc_short',
              'checker', 'lidar1', 'lidar2', 'sharp', 'crawl')
@@ -131,15 +135,43 @@ HIST = 3
 CONTRACT = 'official_cost_v1+referee_finish_v1'
 
 
-def api(path, payload=None, timeout=10):
-    req = urllib.request.Request(BASE + path)
-    if payload is not None:
-        req.data = json.dumps(payload).encode()
-        req.add_header('Content-Type', 'application/json')
-        req.method = 'POST'
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        body = r.read()
-    return json.loads(body) if body else {}
+# 시뮬이 스스로 푸는 일시적 409 (referee.py 와 같은 목록). "already running"
+# 은 여기 없다 — 그건 진짜 충돌이라 덮으면 안 된다.
+RETRY_409 = ('yellow transition in progress', 'world not ready')
+
+
+def api(path, payload=None, timeout=10, tries=5):
+    """일시적 실패를 재시도한다 — `referee.py` 가 사고 끝에 넣은 그 재시도다.
+
+    ⚠️ 왜 필요한가: 2.25 시간 학습 한 번에 이 함수가 **수만 번** 불린다
+    (리셋마다 pose API 7회 이상 + 페널티마다 restore). 재시도가 없으면
+    일시적 409 하나, 느린 응답 하나가 `step()`/`reset()` 밖으로 튀어
+    `model.learn()` 을 통째로 끝낸다. 4 사이클 10 시간이면 확률이 누적된다.
+    """
+    for attempt in range(tries):
+        req = urllib.request.Request(BASE + path)
+        if payload is not None:
+            req.data = json.dumps(payload).encode()
+            req.add_header('Content-Type', 'application/json')
+            req.method = 'POST'
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+            return json.loads(body) if body else {}
+        except urllib.error.HTTPError as e:
+            if e.code != 409 or attempt == tries - 1:
+                raise
+            try:
+                err = json.loads(e.read()).get('error', '')
+            except Exception:
+                err = ''
+            if not any(k in err for k in RETRY_409):
+                raise
+            time.sleep(0.4)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.3)
 
 
 def cap_onehot(lt):
@@ -564,11 +596,15 @@ class _StatePoller(threading.Thread):
         self.lock = threading.Lock()
         self.pose = None
         self.seq = 0
+        self.req_t = -1.0      # 이 pose 를 담아온 폴이 **시작된** 시각
         self.fail_n = 0
         self.stop_flag = False
 
     def run(self):
         while not self.stop_flag:
+            # 요청 시작 시각을 남긴다 — 응답이 담은 세계는 아무리 일러도
+            # 이 시각의 것이다. "명령 이후의 상태"를 이 값으로 판정한다.
+            t_req = time.monotonic()
             try:
                 st = api('/state', timeout=5)
                 v = st.get('vehicle')
@@ -582,6 +618,7 @@ class _StatePoller(threading.Thread):
                     self.pose = (float(v['x']), float(v['y']),
                                  float(v['yaw']), objs)
                     self.seq += 1
+                    self.req_t = t_req
             except Exception:
                 self.fail_n += 1
             time.sleep(self.dt)
@@ -593,6 +630,17 @@ class _StatePoller(threading.Thread):
     def get_seq(self):
         with self.lock:
             return self.pose, self.seq
+
+    def get_after(self, t):
+        """`t` **이후에 시작된** 폴의 결과만 준다 (없으면 None).
+
+        seq 비교로는 부족하다: 명령을 내는 순간 이미 전송 중이던 요청의
+        응답은 seq 를 올리면서도 **명령 이전 세계**를 담고 있는데, 폴 주기
+        40 ms 와 제어 주기 50 ms 가 비슷해 그 겹침이 자주 일어난다."""
+        with self.lock:
+            if self.pose is not None and self.req_t > t:
+                return self.pose
+        return None
 
 
 class CoweekResidualEnv(gym.Env):
@@ -720,22 +768,27 @@ class CoweekResidualEnv(gym.Env):
             time.sleep(0.02)
         return (0.0, 0.0, 0.0, {})
 
-    def _fresh_pose(self, seq0, timeout=2.0):
-        """`seq0` **이후에 새로 받은** pose 만 돌려준다 (P0-3).
+    def _fresh_pose(self, after_t, timeout=8.0):
+        """`after_t` **이후에 시작된** 폴의 pose 만 돌려준다 (P0-3).
 
         제한 시간 안에 새 상태가 안 오면 그 전이를 만들지 않고 죽는다 —
         낡은 상태로 정상 속도로 쓸모없는 전이를 쌓는 것이 조용한 실패의
-        뿌리다. 폴 주기 40 ms 에서 2 초는 폴 50 번이다."""
+        뿌리다.
+
+        ⚠️ timeout 은 **폴러의 HTTP timeout(5 초)보다 커야 한다.** 종전 2 초는
+        역전돼 있어서, 2~5 초짜리 느린 응답 하나가 2.25 시간 학습을 죽일 수
+        있었다 (적대 리뷰 2026-08-22). `api()` 재시도까지 감안해 8 초로 둔다.
+        """
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
-            p, s = self.poll.get_seq()
-            if p is not None and s > seq0:
+            p = self.poll.get_after(after_t)
+            if p is not None:
                 return p
             time.sleep(0.004)
         raise RuntimeError(
-            '상태 폴러가 %.1f 초 동안 새 pose 를 못 줬다 (seq %d 정지, 누적 실패 %d)'
+            '상태 폴러가 %.1f 초 동안 새 pose 를 못 줬다 (누적 실패 %d)'
             ' — /state API 를 확인하라. 낡은 상태로 학습을 계속하지 않는다 (P0-3)'
-            % (timeout, seq0, self.poll.fail_n))
+            % (timeout, self.poll.fail_n))
 
     def _fresh_frame(self, t_after, hold, max_s=3.0):
         """`t_after` 이후의 카메라 프레임이 last_tick 에 실릴 때까지 드라이버를
@@ -761,6 +814,33 @@ class CoweekResidualEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+
+        # ── 0) 월드를 건드리기 전에 **차를 세우고 안전지대로 옮긴다** ──
+        # (적대 리뷰 2026-08-22, 확정) 종전에는 콘 재배치(HTTP 6~8 회 +
+        # settle 0.6 s)를 차가 **이전 에피소드 명령으로 계속 굴러가는 동안**
+        # 했다. 그 창에는 `/speed` 발행이 하나도 없는데, 워치독은 1.0 s 라
+        # (`cmd_vel_adapter_node` 의 `cmd_timeout`) 0.7 s 는 만료되지 않고,
+        # 구동계가 **속도 소스**라 마지막 속도·조향이 그대로 유지된다 —
+        # 최대 0.6~0.8 m 무명령 주행이다. 게다가 rclpy 를 스핀하지 않으므로
+        # 조향도 얼어 있다.
+        # `random_cone_layout` 은 차 위치를 전혀 모르므로(arc 제약만), 180 s
+        # 타임아웃으로 끝난 에피소드에서는 **굴러가는 차 위에 콘이 떨어질 수
+        # 있고**, `reshuffle` 이 settle 뒤 실제 포즈를 정본으로 굳혀버린다 —
+        # 22k 스텝을 통째로 버리게 한 그 오염과 같은 형태다.
+        # 그래서 (a) Dyn 을 우회해 즉시 0 을 내고 몇 틱 실제로 흘려보낸 뒤,
+        # (b) 출발선 뒤로 먼저 옮긴다. 그 자리는 `start_clear 2.0` +
+        # `finish_clear 1.40` = 3.4 m 짜리 **콘 금지 구역**이라 재배치가
+        # 무엇을 뽑든 차와 겹칠 수 없다.
+        self._real_speed.publish(Float64(data=0.0))   # Dyn 우회 (close() 와 동일)
+        for _ in range(2):
+            try:
+                self._spin_one_tick()
+            except RuntimeError:
+                break                                  # 첫 리셋 등 틱이 아직 없을 때
+            self._real_speed.publish(Float64(data=0.0))
+        self._teleport_to(0, 0.0, 0.0, back=0.10)      # 출발선 뒤 = 콘 금지구역
+        self.dyn.on_teleport()                         # 액추에이터 모델도 0 으로
+
         # 과적합 방지: N 에피소드마다 pin 을 뺀 콘을 다시 뿌린다.
         # 재배치가 곧 정본 갱신이라 아래 복원 단계는 건너뛴다.
         self._ep += 1
@@ -834,7 +914,7 @@ class CoweekResidualEnv(gym.Env):
         # 가짜 리셋을 미러링하지 않게 한다
         self._tp_seen = int(lt.get('teleport_n', 0))
 
-        p = self._fresh_pose(self.poll.get_seq()[1])
+        p = self._fresh_pose(time.monotonic())
         _, s, e, half = self.track.locate(p[0], p[1])
         self._s_prev = s
         self._lap_s = 0.0          # 진단값 (종료 판정에는 쓰지 않는다 — P0-1)
@@ -844,17 +924,26 @@ class CoweekResidualEnv(gym.Env):
 
     def step(self, action):
         a = float(np.clip(action[0], -1.0, 1.0))
+        # 배포(`run_policy`)는 프레임이 낡으면 잔차를 0 으로 강제한다. env 도
+        # **같은 규칙**이어야 한다 (적대 리뷰 2026-08-22): 안 그러면 정책이
+        # 배포에서는 무시되는 행동을 학습하고, 더 나쁘게는 `driver` 의 STALE
+        # 감속(age>0.35 → speed ≤ 0.35) 위에 +0.35 를 얹어 그 안전 상한을
+        # 뚫는 법을 배운다.
+        lt_pre = self._features()
+        if (lt_pre['frame_t'] is None
+                or time.monotonic() - lt_pre['frame_t'] > STALE_NO_RESIDUAL):
+            a = 0.0
         res = a * RES_MAX
         base_used = self.cap.base          # 이번 명령이 실제로 얹힌 base
         cmd = float(np.clip(base_used + res, 0.0, V_HARD))
-        seq0 = self.poll.get_seq()[1]      # 행동 발행 전의 마지막 상태 seq
+        t_cmd = time.monotonic()           # 이 시각 **이후에 시작된** 폴만 쓴다
         cmd_out = self._publish(cmd)       # 플랜트 통과 후 실제로 나간 값
 
         self._spin_one_tick()
         self._t += 1
         extra = 0                          # 페널티 회복에 쓴 추가 틱
 
-        p = self._fresh_pose(seq0)         # P0-3: 행동 이후의 새 상태만
+        p = self._fresh_pose(t_cmd)        # P0-3: 행동 이후의 새 상태만
         x, y, yaw, objs = p
         i_now, s, e, half = self.track.locate(x, y)
         ds = self.track.ds(self._s_prev, s)
@@ -897,9 +986,16 @@ class CoweekResidualEnv(gym.Env):
                     fresh.append(n)
             hit = bool(fresh)
 
-        # 랩 진행(진단값)은 실제로 나아간 거리로 센다
+        # 랩 진행(진단값)은 **텔레포트 전까지 실제로 나아간 거리**를 먼저 센다.
+        # ⚠️ 적대 리뷰(2026-08-22)가 "아래 텔레포트 보정과 이중 계상된다"고
+        # 지적했으나 **그 지적이 틀렸다** — 두 항은 연속된 **다른 구간**이다:
+        #   여기 `ds`        : 이전 스텝 위치 → 이번 위치 (텔레포트 **전** 주행)
+        #   아래 `ds(s, s2)` : 이번 위치 → 텔레포트 착지점
+        # 순서를 바꿔 봤더니 정상 주행분이 통째로 버려져 한 바퀴가 30.50 이
+        # 아니라 **27.06** 으로 모자랐다 (`test_env_dyn` G2 가 즉시 잡았다).
+        # 리뷰 발견이라도 측정으로 확인하기 전에는 반영하지 않는다.
         self._lap_s += min(max(ds, -0.5), 0.5)
-        # 텔레포트가 걸리는 스텝은 진행량 진단값을 0 으로 (순간이동 오염 방지)
+        # 보상·진단용 ds 는 여기서 죽인다 — 순간이동 착취 차단
         if off or hit or abs(ds) > 0.25:
             ds = 0.0
 
@@ -921,7 +1017,6 @@ class CoweekResidualEnv(gym.Env):
             else:
                 src = self.track.nearest_idx_near(x, y, car_idx, 10, 15)
             j = self.track.fwd_index(src, TELE_AHEAD)
-            seq1 = self.poll.get_seq()[1]
             self._teleport_to(j)
             tele_t = time.monotonic()   # 신선도 기준은 API 반환 이후 (위 리셋과 동일)
             self.dyn.on_teleport()      # 텔레포트는 차를 세운다 — 모델도 세운다
@@ -929,7 +1024,7 @@ class CoweekResidualEnv(gym.Env):
             # P0-4: 새 장면이 올 때까지 base 로만 달린다 (배포의 잔차 0 구간).
             # 이 틱들은 아래에서 시간 비용에 들어간다.
             extra, _ = self._fresh_frame(tele_t, hold=False)
-            p2 = self._fresh_pose(seq1)
+            p2 = self._fresh_pose(tele_t)
             _, s2, e, half = self.track.locate(p2[0], p2[1])
             # 심판의 강제 이동도 트랙을 따라 앞으로 놓는다 — 진행 진단에 포함
             self._lap_s += min(max(self.track.ds(s, s2), -0.5), 0.5)

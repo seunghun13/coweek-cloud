@@ -284,6 +284,68 @@ check('E11 불확정(CI 가 0 걸침)은 PASS 조건이 아니다',
       not (ps2['mean'] < 0 and ps2['hi'] < 0),
       'mean %+.2f hi %+.2f' % (ps2['mean'], ps2['hi']))
 
+# ════════════════════════════════════════════════════════════════════
+# R — 적대 리뷰 회귀 (2026-08-22). 전부 **구조**를 지키는 검사다:
+#     되돌아가면 조용히 학습이 오염되거나 장시간 학습이 죽는 것들이라
+#     동작 테스트로는 잡기 어렵고(희귀·타이밍 의존) 소스로 못박는다.
+# ════════════════════════════════════════════════════════════════════
+print('\n=== R  적대 리뷰 회귀 ===', flush=True)
+import inspect                                          # noqa: E402
+import re as _re                                        # noqa: E402
+import coweek_env as ce                                 # noqa: E402
+
+src_env = inspect.getsource(ce)
+rs = inspect.getsource(ce.CoweekResidualEnv.reset)
+ss = inspect.getsource(ce.CoweekResidualEnv.step)
+
+# R1: reset() 이 월드를 건드리기 **전에** 차를 세우고 안전지대로 옮긴다
+i_stop = rs.find('_real_speed.publish')
+i_park = rs.find('_teleport_to(0,')
+i_cone = min([x for x in (rs.find('cones.reshuffle'), rs.find('cones.restore'))
+              if x >= 0] or [-1])
+check('R1 정지가 콘 재배치보다 먼저', 0 <= i_stop < i_cone,
+      'stop@%d cone@%d — 굴러가는 차 옆에서 콘을 뿌리면 정본이 오염된다'
+      % (i_stop, i_cone))
+check('R1b 출발선 파킹이 콘 재배치보다 먼저', 0 <= i_park < i_cone,
+      'park@%d cone@%d — 파킹 지점은 3.4 m 콘 금지 구역이다' % (i_park, i_cone))
+
+# R2: 장시간 학습 생존성 — API 재시도와 timeout 정합
+check('R2 api() 에 409·네트워크 재시도', 'RETRY_409' in src_env
+      and 'tries' in inspect.signature(ce.api).parameters,
+      '재시도가 없으면 일시적 409 하나가 2.25 시간 학습을 끝낸다')
+fp_to = inspect.signature(ce.CoweekResidualEnv._fresh_pose).parameters['timeout'].default
+poll_to = [float(x) for x in _re.findall(r"api\('/state',\s*timeout=([\d.]+)\)", src_env)]
+check('R2b _fresh_pose timeout > 폴러 HTTP timeout',
+      bool(poll_to) and fp_to > max(poll_to),
+      '_fresh_pose %.1f s vs 폴러 %.1f s — 역전되면 느린 응답 하나가 학습을 죽인다'
+      % (fp_to, max(poll_to) if poll_to else -1))
+
+# R3: 신선도를 seq 가 아니라 **폴 시작 시각**으로 판정한다
+check('R3 폴 시작 시각 기반 신선도(get_after)',
+      hasattr(ce._StatePoller, 'get_after') and 'get_after' in src_env
+      and '_fresh_pose(t_cmd)' in ss,
+      'seq 비교는 명령 순간 전송 중이던 폴(=명령 이전 세계)을 통과시킨다')
+
+# R4: STALE 이면 학습도 잔차 0 — 배포와 같은 규칙
+check('R4 env 에도 STALE 게이트', 'STALE_NO_RESIDUAL' in ss,
+      '없으면 정책이 배포에서 무시되는 행동을 배우고 driver 안전상한을 뚫는다')
+_rp2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'run_policy.py'), encoding='utf-8').read()
+check('R4b 배포가 그 상수를 env 에서 import',
+      'STALE_NO_RESIDUAL' in _rp2.split('class ')[0]
+      and 'from coweek_env import' in _rp2,
+      '두 곳에 따로 적으면 조용히 어긋난다')
+
+# R5: _lap_s 는 텔레포트 **전** 주행분을 먼저 세야 한다.
+# 리뷰가 "이중 계상"이라며 순서를 뒤집으라고 했는데 **그게 틀렸다** — 두 항은
+# 연속된 다른 구간이라, 뒤집으면 정상 주행분이 버려져 한 바퀴가 27.06 m 로
+# 모자란다 (test_env_dyn G2 가 잡았다). 그 되돌림을 여기서 못박는다.
+i_zero = ss.find('ds = 0.0')
+i_lap = ss.find('self._lap_s +=')
+check('R5 _lap_s 누적이 ds 오염 제거보다 먼저', 0 <= i_lap < i_zero,
+      'lap@%d zero@%d — 뒤집으면 텔레포트 전 주행분이 통째로 버려진다'
+      % (i_lap, i_zero))
+
 if args.unit:
     print()
     if FAIL:

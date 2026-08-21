@@ -44,9 +44,9 @@ from std_msgs.msg import Float64
 
 import driver as drv
 from coweek_env import (CAP_NAMES, CONTRACT, DEFAULT_LT, HIST, OBS_ROW_DIM,
-                        RES_MAX, V_HARD, obs_row)
-
-STALE_NO_RESIDUAL = 0.35     # 초. driver.STALE_SLOW 와 같은 문턱
+                        RES_MAX, STALE_NO_RESIDUAL, V_HARD, obs_row)
+# STALE_NO_RESIDUAL 은 **학습 env 에서 가져온다** — 두 곳에 따로 적으면
+# 조용히 어긋나고, 그 순간 학습과 배포가 다른 규칙으로 달린다.
 # ⚠️ **append 로그**여야 한다. 심판은 런마다 run.sh 를 새로 spawn 하고 run.sh
 # 는 죽은 러너를 재시작하므로, 고정 경로를 덮어쓰면 3번째 런에서 모델 로드가
 # 실패해도 4번째 런의 러너가 깨끗한 상태로 덮어써 평가가 그 배치를 유효로 본다.
