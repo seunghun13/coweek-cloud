@@ -6,6 +6,8 @@
 가장 중요한 것은 **TEST 1/2** 다: 랜덤화를 끄거나 참 플랜트 값으로 두면
 배선이 명령을 **한 비트도 바꾸지 않는다**. 이게 깨지면 `eval_policy.py` 의
 게이트가 무엇을 재는지 알 수 없게 된다.
+
+조향·관측 지연 축은 전수검수(P1-2/P1-4)로 제거됐다 — 여기도 같이 지웠다.
 """
 import sys
 import os
@@ -28,7 +30,6 @@ def check(name, ok, detail=''):
 
 # 실제 랩에서 나오는 종류의 명령열 (상한 계단 + 콘 감속)
 SEQ = [0.0, 0.9, 0.9, 0.45, 0.45, 0.9, 0.6, 0.4, 0.55, 0.9, 0.9, 0.0, 0.9]
-STEER_SEQ = [0.0, 0.349, -0.349, 0.1, 0.0, -0.2, 0.349, 0.0]
 
 
 def test_passthrough(enabled, tag):
@@ -37,9 +38,7 @@ def test_passthrough(enabled, tag):
         d.p = dict(NOMINAL)
         d.reset_state()
     ev = max(abs(d.speed(v) - v) for v in SEQ)
-    es = max(abs(d.steer(s) - s) for s in STEER_SEQ)
     check('TEST %s speed 순수통과' % tag, ev == 0.0, '|out-in| max %.1e' % ev)
-    check('TEST %s steer 순수통과' % tag, es == 0.0, '|out-in| max %.1e' % es)
 
 
 # ── TEST 1  랜덤화 OFF -> 순수 통과 ──
@@ -94,14 +93,11 @@ for k in (0, 1, 2, 3):
     want = [0.0] * k + src[:len(src) - k]
     check('TEST 5 구동 지연 %d 틱' % k, out == want, '%s' % [round(v, 2) for v in out])
 
-# ── TEST 6  서보 각속도 한계 ──
-d = Dyn(DT, enabled=True)
-d.p = dict(NOMINAL, steer_rate=4.0)      # 틱당 0.20 rad
-d.reset_state()
-s = [d.steer(0.349) for _ in range(3)]
-check('TEST 6 서보 4.0 rad/s -> 틱당 0.20 rad',
-      abs(s[0] - 0.2) < 1e-9 and abs(s[1] - 0.349) < 1e-9,
-      'seq=%s' % [round(v, 4) for v in s])
+# ── TEST 6  제거된 축이 정말 없다 (조향·관측 지연 재유입 방지) ──
+check('TEST 6 조향·관측 지연 축이 없다',
+      not hasattr(Dyn(DT), 'steer')
+      and 'steer_rate' not in DYN_RANGES and 'obs_delay' not in DYN_RANGES,
+      '전수검수 P1-2/P1-4 — 되넣으려면 실차 실측이 먼저다')
 
 # ── TEST 7  sample() 이 범위를 지키고 재현 가능하다 ──
 r1 = np.random.default_rng(3)
@@ -112,16 +108,16 @@ check('TEST 7 같은 seed -> 같은 플랜트열', a == b)
 ok_range = all(DYN_RANGES[k][0] <= p[k] <= DYN_RANGES[k][1]
                for p in a for k in DYN_RANGES)
 check('TEST 7 전 축이 지정 범위 안', ok_range)
-spread = len({(round(p['accel'], 3), p['act_delay'], p['obs_delay']) for p in a})
+spread = len({(round(p['accel'], 3), p['act_delay']) for p in a})
 check('TEST 7 실제로 흔들린다 (50개 중 고유 %d)' % spread, spread >= 40)
 
-# ── TEST 8  참 플랜트가 학습 분포 안에 있다 (상단이 시뮬 값을 덮는가) ──
+# ── TEST 8  범위의 정직성 ──
+# ⚠️ "상단 9.0 ≥ 실측 하한 4.5" 는 **참 플랜트 포함의 증명이 아니다**
+# (전수검수 P1-3: 한 틱 완전 추종에는 18 m/s² 가 필요해 nominal 은 연속
+# uniform 밖이다). 이 검사는 상한이 실측 하한 아래로 좁혀지는 퇴행만 막는다.
 check('TEST 8 가속 상단 ≥ 실측 하한 4.5', DYN_RANGES['accel'][1] >= 4.5,
       'accel hi=%.1f' % DYN_RANGES['accel'][1])
-check('TEST 8 서보 범위가 시뮬 참값 10 을 포함',
-      DYN_RANGES['steer_rate'][0] <= 10.0 <= DYN_RANGES['steer_rate'][1])
-check('TEST 8 지연 하한이 0 (참 플랜트 포함)',
-      DYN_RANGES['act_delay'][0] == 0 and DYN_RANGES['obs_delay'][0] == 0)
+check('TEST 8 지연 하한이 0', DYN_RANGES['act_delay'][0] == 0)
 
 print()
 if FAIL:

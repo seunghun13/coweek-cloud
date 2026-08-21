@@ -10,18 +10,39 @@
 ## driver.py 를 건드리지 않는다
 `/speed` 퍼블리셔만 가로채 base 를 읽고, env 가 base+residual 을 대신 낸다.
 residual=0 이면 **정확히 racer-v64** 다. 실차에서 이상하면 잔차만 끄면 된다.
-(driver.py 에는 v70 계측 dict 한 곳만 추가돼 있고, 그건 아무도 읽지 않는
-순수 대입이라 주행이 불변임을 score_now ok235 + 예선 3런으로 검증했다.)
+(driver.py 에는 계측 dict `last_tick` 과 텔레포트 카운터 `teleport_n` 만
+추가돼 있고, 둘 다 driver 안에서 아무도 읽지 않는 순수 대입이다.)
 
-## 보상 (공식 점수의 초 단위 비용)
-    r = W * (K_PROG * ds - C)
-    C = dt + 5·I_off + 5·I_cone + dt·(2·B_edge + 3·B_cone) + 0.01·(Δa)²
-공식 계수(5초/5초)는 고정하고 dense 항은 보조로만 쓴다.
+## 계약 (2026-08-21 전수검수 반영 — `official_cost_v1` / `referee_finish_v1`)
+- **종료 = 공식 결승선** (P0-1): 심판과 같은 판정(앞점 선분 교차 + 어드밴스
+  N/2)을 그대로 이식했다 (`FinishDetector`). 누적 arc 는 진단값일 뿐이다.
+  선분 끝점 바깥으로 지나가면 랩이 인정되지 않고 **계속 돈다** — 실측된
+  1순위 병목(결승선 놓침, 1회 ≈ 50초)이 이제 학습에 존재한다.
+- **완주 = terminated** (P0-2): 목표 달성 종료라 SB3 가 부트스트랩하지
+  않는다. 150 초 안전망만 truncated 다.
+- **보상 = 공식 비용 그대로** (P0-6):
+      r = -W · (Δt + 5·I_off + 5·I_cone)
+  진행 보상·배리어·스무딩 항은 전부 뺐다. K_PROG 논증은 할인 때문에
+  성립하지 않았고(어떤 스칼라도 Σγᵗ·Δs 를 상수로 못 만든다), 결승선 놓침을
+  모델링하는 순간 raw 진행 보상은 "추가 한 바퀴 30.5 m = 30.5 초 이득"으로
+  실제 50 초 하방을 상쇄해 버린다. Δt 는 페널티 회복에 쓴 추가 틱까지 센다
+  (심판의 시계는 그동안에도 돈다).
+- **보상용 상태는 항상 새 상태** (P0-3): `/state` 폴에 seq 를 매기고, 행동
+  발행 이전 seq 의 상태는 쓰지 않는다. 폴 실패·vehicle 누락은 (0,0,0) 으로
+  대체하지 않고 세며, 새 상태가 제때 안 오면 **크게 죽는다** — 낡은 상태로
+  전이를 쌓는 것이 조용한 실패의 뿌리다.
+- **텔레포트 후 관측은 새 장면** (P0-4): 페널티 텔레포트 뒤 새 카메라
+  프레임이 올 때까지 base 로만 달리고(배포의 잔차 0 구간과 동일), 관측
+  히스토리와 `prev_a` 를 리셋한다. driver v34c 가 텔레포트를 감지하면
+  (`teleport_n` 증가) 같은 리셋을 미러링한다 — 배포 러너와 동일 규칙.
+- **학습 콘 분포 = 평가 콘 분포** (P0-8): 랜덤 배치를 쓰되 **cone6 만 예선맵
+  자리에 고정**한다. 이건 대회 규칙이 아니라 측정 전략이다 — cone6 가 아직
+  미해결 병목이라 흩어버리면 성적이 실제보다 좋아 보인다(사용자 판단).
+  중요한 것은 학습과 평가가 **같은 분포**를 본다는 것이고, 지금 둘 다 그렇다.
 
 ## 텔레포트 + **콘 복원**
 심판은 이탈·콘히트 때 차를 중심선 0.3 m 앞으로 옮기고 **맞은 콘을 원위치**
-시킨다. env 도 **둘 다** 한다. 그 스텝의 진행량 ds 는 0 으로 만든다 —
-안 그러면 정책이 "이탈해서 순간이동으로 전진" 을 배운다.
+시킨다. env 도 **둘 다** 한다.
 
 ⚠️ **콘 복원을 빠뜨려 22k 스텝 학습 하나를 통째로 버렸다 (2026-08-21).**
 6개 중 5개가 밀려나고 cone4 는 1.78 m 굴러 누웠는데, 히트 판정이 거리
@@ -30,13 +51,12 @@ residual=0 이면 **정확히 racer-v64** 다. 실차에서 이상하면 잔차�
 ## 동역학 랜덤화 (`dyn=True`, 기본값 — 사용자 승인 2026-08-21)
 이 시뮬의 구동계는 **속도 소스**라 감속이 폴 1개 안에 끝난다(≥4.5 m/s² 실측).
 **감속이 공짜인 플랜트에서 속도 잔차를 학습하면 정책은 반드시 그걸 착취한다.**
-그래서 에피소드마다 가감속 한계·조향 서보 각속도·구동/관측 지연을 다시 뽑는다.
-근거와 범위는 `dyn.py`, 검증은 `test_dyn.py`.
+그래서 에피소드마다 가감속 한계·구동 지연을 다시 뽑는다. 근거와 범위는
+`dyn.py` (조향·관측 지연 축은 전수검수로 제거됨), 검증은 `test_dyn.py`.
 
 **평가·배포에서는 끈다.** `eval_policy.py` 는 공식 심판을 쓰고
-`run_policy.py` 는 참 플랜트에 그대로 낸다 — 랜덤화는 학습 분포를 넓히는
-도구지 평가 조건이 아니다. `dyn=False` 면 이 파일의 동작이 랜덤화 도입
-전과 **한 비트도 다르지 않다** (`test_env_dyn.py` 가 시뮬에서 확인한다).
+`run_policy.py` 는 참 플랜트에 그대로 낸다. `dyn=False` 면 이 파일의 동작이
+랜덤화 도입 전과 **한 비트도 다르지 않다** (`test_env_dyn.py` 가 확인한다).
 """
 import json
 import math
@@ -65,7 +85,8 @@ ROUTE = ('/mnt/c/Users/정승훈/Desktop/coweek/자율주행 해커톤 정보/'
 
 # ── 채점 상수 (공식 스크립트와 동일) ──
 OFF_MARGIN = 0.12          # 이탈: |e| > 반폭 + 0.12  (차량 중심 한 점)
-CONE_HIT_R = 0.1525        # 차 반폭 0.0975 + 콘 반경 0.055 (보상 정형용)
+FRONT_M = 0.12             # 결승선 판정용 앞점 (referee.py FRONT)
+CONE_HIT_R = 0.1525        # 차 반폭 0.0975 + 콘 반경 0.055 (스폰 여유 계산용)
 TELE_AHEAD = 0.30          # 페널티 후 중심선 0.3 m 앞으로
 CONE_MOVE_TOL = 0.01       # 히트 판정: 콘이 1 cm 이상 움직였는가 (심판과 동일)
 CONE_Z_TOL = 0.04          # 〃 4 cm 이상 내려앉았는가 (넘어짐)
@@ -81,36 +102,33 @@ SPAWN_CONE_CLEAR = 0.35    # 리셋 스폰이 콘 위에 떨어지지 않게
 STATE_JSON = ('/mnt/c/Users/정승훈/Desktop/coweek/자율주행 해커톤 정보/'
               '시뮬레이터 자료/api-dumps-AMET2026/state.json')
 
-# ── 보상 계수 ──
+# ── 보상 계수 (`official_cost_v1`) ──
 W_SCALE = 0.1
-K_PROG = 1.0               # s/m — 1 m 전진 = 1초 이득
 P_OFF = 5.0
 P_CONE = 5.0
-W_EDGE = 2.0
-W_CONEROOM = 3.0
-W_SMOOTH = 0.01
+# K_PROG / 배리어 / 스무딩 계수는 전수검수 P0-6 으로 제거됐다 (모듈 독스트링).
 
 # ── 에피소드 ──
 DT = 1.0 / drv.RATE_HZ     # 0.05 s
-# 워밍업은 **텔레포트 직후 last_tick 을 채우기 위한 최소값**만 남긴다 (5틱).
-# 원래 1.2 초였던 이유는 8 초 슬라이스 시절 에피소드가 트랙 임의 지점에서
-# 정지 상태로 시작해 "코너 한복판 정지출발"이라는 가짜 상태를 과학습하기
-# 때문이었다. 랩을 출발선에서 시작하는 지금은 정지출발이 **심판과 같은 진짜
-# 상태**이고 랩당 1회(0.1 %)뿐이라 편향이 될 수 없다.
-# 오히려 1.2 초는 배포(run_policy.py 는 워밍업이 없다)와 어긋나고, 심판이
-# 시간을 재는 구간을 정책에게 가린다.
+# 워밍업 = 텔레포트 직후 last_tick·새 프레임을 채우는 시간. **차는 세워 둔다**
+# (P1-7): 베이스로 미리 달리는 "숨은 주행 구간"은 심판이 시간을 재는 구간을
+# 정책에게 가리고, 워밍업이 없는 배포(run_policy.py)와 어긋난다. 정지 출발은
+# 심판과 같은 진짜 상태다.
 WARMUP_S = 0.25
 EPISODE_S = 8.0
 RES_MAX = 0.35             # 속도 잔차 범위 [-RES_MAX, +RES_MAX] (대칭)
 #   대칭으로 두는 이유: action 0 이 정확히 잔차 0 = racer-v64 가 된다.
 #   SAC 초기 정책이 0 근처이므로 학습 시작점이 검증된 베이스와 같고,
-#   zero residual 이 v64 를 재현하는지 그대로 검증할 수 있다 (GPT Test 1).
-#   실차에서 이상하면 잔차를 0 으로 고정하는 것만으로 v64 복귀.
+#   zero residual 이 v64 를 재현하는지 그대로 검증할 수 있다.
 V_HARD = 1.40              # 안전 상한. 정책이 이 위로 못 간다
 
 CAP_NAMES = ('vmax', 'alat', 'cone_slow', 'cone_near', 'arc_short',
              'checker', 'lidar1', 'lidar2', 'sharp', 'crawl')
 HIST = 3
+
+# 계약 버전 — 모델 매니페스트와 평가기가 대조한다. 종료·보상·관측의 의미가
+# 바뀌면 반드시 올릴 것 (기존 모델·버퍼가 조용히 오작동하는 것을 막는다).
+CONTRACT = 'official_cost_v1+referee_finish_v1'
 
 
 def api(path, payload=None, timeout=10):
@@ -165,9 +183,7 @@ def obs_row(lt, prev_a=0.0):
     넣지 않는다 — 실차에 없는 정보다. 전부 베이스 제어기가 카메라·라이다에서
     이미 뽑아내는 값이거나 자기 명령 이력이다.
 
-    `prev_a` = **직전 행동**(잔차, [-1,1] 정규화). 이게 없으면 보상의
-    `W_SMOOTH·(a − prev_a)²` 항을 정책이 원리적으로 최적화할 수 없다 —
-    자기가 직전에 뭘 냈는지 모르는 채로 그 차이를 벌점받기 때문이다.
+    `prev_a` = **직전 행동**(잔차, [-1,1] 정규화). 자기 명령 이력이다.
     `lt['speed']` 는 **base 명령**이라 잔차가 얹히기 전 값이므로 대체가 안 된다.
     ⚠️ `run_policy.py` 가 **똑같이** 채워야 한다. 학습과 배포가 다른 관측을
     쓰면 조용히 성능만 무너진다."""
@@ -197,7 +213,7 @@ DEFAULT_LT = {
     'mode': 'wait', 'carea': 0.0, 'fmin': drv.LID_RANGE_MAX, 'lbias': 0.0,
     'dodging': False, 'sharp': False, 'crawl': False, 'checker': False,
     'arc_safe': 1.0, 'pass_hold': 0, 'pass_side': 0.0, 'ncone': 0,
-    'band_px': 0, 'frame_t': None,
+    'band_px': 0, 'frame_t': None, 'teleport_n': 0,
 }
 OBS_ROW_DIM = 13 + len(CAP_NAMES)   # 12 관측 + 직전 행동 1 + 상한 one-hot
 
@@ -216,8 +232,59 @@ class Track:
         self.half = np.linalg.norm(outer - inner, axis=1) / 2.0
         v = outer - inner
         self.u = v / np.linalg.norm(v, axis=1)[:, None]
-        nxt = np.roll(self.wp, -1, axis=0)
-        self.yaw = np.arctan2(nxt[:, 1] - self.wp[:, 1], nxt[:, 0] - self.wp[:, 0])
+        # 결승 선분 (심판과 동일: inner[0] ~ outer[0]) + 심판의 N
+        self.inner0 = (float(inner[0, 0]), float(inner[0, 1]))
+        self.outer0 = (float(outer[0, 0]), float(outer[0, 1]))
+        self.N = len(self.wp) - 1
+        # ⚠️ route.json 은 **닫힌 루프**다 — wp[N] 이 wp[0] 과 완전히 같은
+        # 중복점이다 (실측 closing gap 0.000000). 그래서 np.roll 로 그냥
+        # 계산하면 yaw[N] = atan2(0,0) = 0 (동쪽) 이 되는데, 그 지점의 진짜
+        # 트랙 헤딩은 -1.5601 rad (남쪽) 이라 **89.4° 오차**다. 결승선 바로
+        # 그 자리라, 텔레포트가 그 인덱스를 고르면 차를 트랙과 거의 수직으로
+        # 놓는다 — 1순위 병목 구간의 학습 분포가 통째로 오염된다.
+        # 심판은 fwd_index 를 `% N` 으로 돌려 중복점을 절대 쓰지 않는다.
+        nxt = np.roll(self.wp[:self.N], -1, axis=0)
+        yaw = np.arctan2(nxt[:, 1] - self.wp[:self.N, 1],
+                         nxt[:, 0] - self.wp[:self.N, 0])
+        self.yaw = np.concatenate([yaw, yaw[:1]])   # 중복점은 wp[0] 의 헤딩
+
+    def off_track(self, x, y):
+        """심판 `off_track()` 의 1:1 이식 — **방사거리**로 잰다.
+
+        ⚠️ 종전에는 `|e|`(법선 사영 횡오차)로 판정했는데, 심판은 최근접
+        웨이포인트까지의 **유클리드 거리**를 본다. 사영은 항상 그 거리 이하라
+        env 가 **한 방향으로만 관대**했다 (실측: 관대한 폭 중앙 2.4 mm,
+        p90 4.3 cm, 최대 31 cm, env 가 더 엄격한 표본 0/1032). 이 프로젝트의
+        실측 이탈 초과분이 **중앙값 7 mm** 라, 심판이 +5 를 주는 이탈의 상당수를
+        보상이 무벌로 넘겼다는 뜻이다 — 보상이 유일한 학습 신호이므로 정책은
+        심판이 처벌하는 라인을 학습하고 배포에서 그대로 반납한다.
+        """
+        d2 = ((self.wp[:self.N, 0] - x) ** 2 + (self.wp[:self.N, 1] - y) ** 2)
+        i = int(np.argmin(d2))
+        return math.sqrt(float(d2[i])) > float(self.half[i]) + OFF_MARGIN
+
+    def fwd_index(self, i, dist):
+        """심판 `fwd_index()` 1:1 — 중복 종점을 쓰지 않도록 `% N` 으로 돈다."""
+        d, N = 0.0, self.N
+        start = i
+        while d < dist:
+            j = (i + 1) % N
+            d += float(np.linalg.norm(self.wp[j] - self.wp[i]))
+            i = j
+            if i == start:
+                break
+        return i
+
+    def nearest_idx_near(self, x, y, from_idx, back, fwd):
+        """심판 `nearest_idx_near()` 1:1 (히트 텔레포트에서 쓴다)."""
+        N = self.N
+        best_i, best_d = from_idx, 1e18
+        for k in range(-back, fwd + 1):
+            i = (from_idx + k) % N
+            d = (self.wp[i, 0] - x) ** 2 + (self.wp[i, 1] - y) ** 2
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i
 
     def locate(self, x, y):
         """(가장 가까운 인덱스, arc 위치 s, 부호 있는 횡오차, 반폭)
@@ -263,6 +330,89 @@ class Track:
         return d
 
 
+class FinishDetector:
+    """심판 결승선 판정의 1:1 이식 (referee.py `Referee`).
+
+    종료가 누적 arc 거리였을 때는 "결승 선분 **끝점 바깥**으로 지나가 랩이
+    인정되지 않는" 사고 — 실측된 1순위 병목, 1회 ≈ 50초 — 가 학습에 존재할
+    수 없었다 (전수검수 P0-1). 판정은 심판과 동일하게만 한다:
+
+      앞점(pose + 0.12 m, heading 방향)의 이동 선분이 결승 선분
+      (inner[0]~outer[0], 폭 0.70 m)과 교차 **그리고** 누적 웨이포인트
+      어드밴스 > N/2.
+
+    텔레포트(앞점 점프 > 0.5 m 또는 `note_teleport()`)는 prev 를 지운다 —
+    순간이동 선분이 결승선을 가로지르는 가짜 크로싱을 막는 심판의 규칙
+    그대로다.
+    """
+
+    def __init__(self, track):
+        self.tr = track
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+        self.last_idx = None
+        self.adv = 0
+
+    def note_teleport(self):
+        # 심판도 페널티 텔레포트 직후 prev 를 지운다 (move_to_center 뒤
+        # `self.prev = None`)
+        self.prev = None
+
+    def _nearest(self, x, y):
+        d2 = ((self.tr.wp[:self.tr.N, 0] - x) ** 2
+              + (self.tr.wp[:self.tr.N, 1] - y) ** 2)
+        return int(np.argmin(d2))
+
+    def _nearest_near(self, x, y, from_idx, back, fwd):
+        N = self.tr.N
+        best_i, best_d = from_idx, 1e18
+        for k in range(-back, fwd + 1):
+            i = (from_idx + k) % N
+            d = ((self.tr.wp[i, 0] - x) ** 2 + (self.tr.wp[i, 1] - y) ** 2)
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i
+
+    def _crossed(self, f):
+        if self.prev is None:
+            return False
+        a, b = self.tr.inner0, self.tr.outer0
+        px, py = self.prev
+        d = (f[0] - px) * (b[1] - a[1]) - (f[1] - py) * (b[0] - a[0])
+        if abs(d) < 1e-12:
+            return False
+        t = ((a[0] - px) * (b[1] - a[1]) - (a[1] - py) * (b[0] - a[0])) / d
+        u = ((a[0] - px) * (f[1] - py) - (a[1] - py) * (f[0] - px)) / d
+        return 0 <= t <= 1 and 0 <= u <= 1
+
+    def update(self, x, y, yaw):
+        """이번 pose 로 판정을 한 틱 진행. 완주면 True.
+
+        심판 `evaluate()` 와 같은 순서다: 크로싱을 먼저 보고, 완주면
+        어드밴스 갱신 없이 즉시 반환한다."""
+        f = (x + math.cos(yaw) * FRONT_M, y + math.sin(yaw) * FRONT_M)
+        if self.prev is not None and math.hypot(f[0] - self.prev[0],
+                                                f[1] - self.prev[1]) > 0.5:
+            self.prev = None
+        crossed = self._crossed(f)
+        self.prev = f
+        if crossed and self.adv > self.tr.N / 2:
+            return True
+        i = (self._nearest(x, y) if self.last_idx is None
+             else self._nearest_near(x, y, self.last_idx, 10, 15))
+        if self.last_idx is not None:
+            d = i - self.last_idx
+            if d > self.tr.N / 2:
+                d -= self.tr.N
+            elif d < -self.tr.N / 2:
+                d += self.tr.N
+            self.adv += d
+        self.last_idx = i
+        return False
+
+
 class _SpeedCapture:
     """driver 의 /speed 퍼블리시를 가로챈다. 유일한 개입 지점."""
 
@@ -295,13 +445,19 @@ class Cones:
     심판은 처음부터 변위(1 cm xy / 4 cm z)로 판정하고 있었다. 그쪽이 맞다.
     """
 
-    ## 배치 랜덤화 (사용자 지시 2026-08-21)
-    ##   과적합 방지를 위해 **cone6 를 뺀 5개**를 에피소드마다 다시 뿌린다.
+    ## 배치 랜덤화
     ##   생성기는 **심판의 `random_cone_layout` 을 그대로** 쓴다 — 학습과 평가가
     ##   같은 분포를 쓰지 않으면 게이트가 무엇을 재는지 알 수 없다. 새 배치
     ##   생성기를 발명하지 않는다 (이 프로젝트에서 그 부류는 전부 기각됐다).
-    ##   cone6 를 고정하는 이유는 심판 `--pin cone6` 와 같다: 결승 1.40 m 전
-    ##   코너 출구라는 위치 자체가 최대 병목이라, 흩어버리면 병목이 사라진다.
+    ##   기본 pin 은 **cone6** — 대회 규칙이 아니라 **우리 측정 전략**이다
+    ##   (사용자 판단, 2026-08-22 재확인). 실제 본선은 예선에서 콘 위치가
+    ##   바뀔 뿐이라 6개가 다 움직일 수 있다. 그런데 우리는 아직 cone6 를
+    ##   통과하지 못하고 있고, **그 자리(결승 1.40 m 전, 코너 출구)가 최대
+    ##   병목**이라 랜덤으로 흩어버리면 병목이 사라져 성적이 실제보다 좋아
+    ##   보인다. 그래서 그 콘만 예선맵 자리에 묶어 둔다.
+    ##   전수검수 P0-8 의 요지("학습과 평가가 **같은 분포**여야 한다")는 그대로
+    ##   유효하고, `eval_policy.py --finals` 도 같은 분포(pin=cone6)를 쓴다.
+    ##   cone6 문제가 풀리면 양쪽 다 `pin=()`(6개 전부 랜덤)으로 옮긴다.
 
     def __init__(self, path=STATE_JSON, pin=('cone6',)):
         self.base = {n: dict(p) for n, p in
@@ -387,29 +543,19 @@ class Cones:
                    for b in self.base.values())
 
 
-class _SteerRelay:
-    """driver 의 /steering 을 가로채 서보 각속도 한계를 통과시킨 뒤 낸다.
-
-    드라이버의 `tick()` **안에서 즉시** 재퍼블리시한다. env 가 나중에 내면
-    조향이 속도보다 한 틱 밀려 랜덤화가 아니라 버그가 된다.
-    `Dyn.enabled=False` 면 값이 그대로 통과한다 (test_dyn TEST 1).
-    """
-
-    def __init__(self, real, dyn):
-        self.real = real
-        self.dyn = dyn
-        self.last = 0.0
-
-    def publish(self, msg):
-        self.last = self.dyn.steer(float(msg.data))
-        self.real.publish(Float64(data=self.last))
-
-
 class _StatePoller(threading.Thread):
     """월드 포즈를 별도 스레드에서 폴링한다.
 
-    20 Hz 제어 예산 50 ms 안에서 HTTP 왕복(~20 ms)을 하면 드라이버가
-    카메라 프레임을 놓친다. **보상 계산 전용**이고 관측에는 안 들어간다."""
+    20 Hz 제어 예산 50 ms 안에서 HTTP 왕복(~1 ms 실측 p50)을 그래도 본 루프
+    밖에 두는 이유는 가끔 오는 느린 응답 하나가 드라이버 틱을 밀면 안 되기
+    때문이다. **보상 계산 전용**이고 관측에는 안 들어간다.
+
+    전수검수 P0-3 반영:
+    - pose 마다 **seq** 를 매긴다. env 는 "이번 행동 이후에 새로 받은 상태"만
+      쓴다 (`_fresh_pose`).
+    - `/state` 실패·`vehicle` 필드 누락은 **세고**(fail_n), (0,0,0) 으로
+      대체하지 않는다 — 이전 pose 는 이전 seq 그대로 남아 재사용이 차단된다.
+    """
     daemon = True
 
     def __init__(self, hz=25.0):
@@ -417,26 +563,36 @@ class _StatePoller(threading.Thread):
         self.dt = 1.0 / hz
         self.lock = threading.Lock()
         self.pose = None
+        self.seq = 0
+        self.fail_n = 0
         self.stop_flag = False
 
     def run(self):
         while not self.stop_flag:
             try:
                 st = api('/state', timeout=5)
-                v = st.get('vehicle') or {}
+                v = st.get('vehicle')
+                if (not isinstance(v, dict) or 'x' not in v or 'y' not in v
+                        or 'yaw' not in v):
+                    raise ValueError('vehicle 필드 누락')
                 # 콘은 dict 통째로 넘긴다 — z 가 있어야 "넘어짐"을 본다
                 objs = {n: p for n, p in (st.get('objects') or {}).items()
                         if n.startswith('cone')}
                 with self.lock:
-                    self.pose = (float(v.get('x', 0.0)), float(v.get('y', 0.0)),
-                                 float(v.get('yaw', 0.0)), objs)
+                    self.pose = (float(v['x']), float(v['y']),
+                                 float(v['yaw']), objs)
+                    self.seq += 1
             except Exception:
-                pass
+                self.fail_n += 1
             time.sleep(self.dt)
 
     def get(self):
         with self.lock:
             return self.pose
+
+    def get_seq(self):
+        with self.lock:
+            return self.pose, self.seq
 
 
 class CoweekResidualEnv(gym.Env):
@@ -447,15 +603,18 @@ class CoweekResidualEnv(gym.Env):
     def __init__(self, seed=0, episode_s=EPISODE_S, warmup_s=WARMUP_S,
                  start_lo=0, start_hi=None, log=None, dyn=True, dyn_ranges=None,
                  cone_reshuffle=1, cone_pin=('cone6',),
-                 lap_episode=True, max_episode_s=150.0,
+                 lap_episode=True, max_episode_s=180.0,   # = referee.TIME_LIMIT
                  start_at_line=True):
         super().__init__()
         self.rng = np.random.default_rng(seed)
         self.track = Track()
-        # 에피소드 = **한 바퀴** (사용자 지시 2026-08-21). `episode_s` 는
-        # lap_episode=False 일 때만 쓰이고, 랩 모드에선 max_episode_s 가
-        # "차가 멈춰 영원히 안 끝나는" 경우를 막는 안전망일 뿐이다.
+        self.finish = FinishDetector(self.track)
+        # 에피소드 = **한 바퀴**, 종료 = 공식 결승선 (P0-1). `episode_s` 는
+        # lap_episode=False(배선 테스트용 슬라이스)일 때만 쓰이고, 랩 모드에선
+        # max_episode_s 가 "차가 멈추거나 결승을 계속 놓쳐 영원히 안 끝나는"
+        # 경우를 막는 안전망일 뿐이다.
         self.lap_episode = bool(lap_episode)
+        self.max_episode_s = float(max_episode_s)
         self.episode_steps = int((max_episode_s if lap_episode
                                   else episode_s) / DT)
         # 랩은 **출발선에서 출발선까지**여야 화면·심판과 경계가 일치한다.
@@ -482,9 +641,8 @@ class CoweekResidualEnv(gym.Env):
         self._real_speed = self.node.pub_speed
         self.cap = _SpeedCapture()
         self.node.pub_speed = self.cap
-        # 조향은 가로채서 서보 한계만 태우고 바로 흘려보낸다 (값은 안 바꾼다)
-        self._real_steer = self.node.pub_steer
-        self.node.pub_steer = _SteerRelay(self._real_steer, self.dyn)
+        # 조향은 건드리지 않는다 — 조향 랜덤화 축은 전수검수로 제거됐다
+        # (dyn.py 독스트링). /steering 은 드라이버가 직접 낸다 = 참 플랜트.
 
         self.poll = _StatePoller()
         self.poll.start()
@@ -493,18 +651,27 @@ class CoweekResidualEnv(gym.Env):
         self.observation_space = spaces.Box(-5.0, 5.0,
                                             (OBS_ROW_DIM * HIST,), np.float32)
         self._hist = []
-        self._raw = []
         self._prev_a = 0.0
-        self._hit_rearm = {}
+        self._hit_state = {}
+        self._tp_seen = 0
+        self._time_s = 0.0
 
     # ── 내부 ────────────────────────────────────────────────────────
     def _spin_one_tick(self):
-        """드라이버 타이머가 한 번 돌 때까지 spin. 20 Hz 벽시계에 묶인다."""
+        """드라이버 타이머가 한 번 돌 때까지 spin. 20 Hz 벽시계에 묶인다.
+
+        틱이 1 초 동안 없으면 **크게 죽는다** (P1-8) — 그 스텝을 0.05 초짜리
+        전이로 학습하는 것이 조용한 실패이기 때문이다. 카메라가 1 초 이상
+        멎은 것은 환경 고장이지 학습할 상태가 아니다."""
         n0 = self.cap.n
         t0 = time.monotonic()
-        while self.cap.n == n0 and time.monotonic() - t0 < 1.0:
+        while self.cap.n == n0 and time.monotonic() - t0 < 2.0:
             rclpy.spin_once(self.node, timeout_sec=0.005)
-        return self.cap.n != n0
+        if self.cap.n == n0:
+            raise RuntimeError('드라이버 틱이 2 초 동안 없다 — 환경 고장. '
+                               '이 전이를 학습하지 않고 죽는다 (P1-8). '
+                               '체크포인트에서 --resume 으로 이어갈 것')
+        return True
 
     def _publish(self, speed):
         """플랜트(가감속 한계 + 구동 지연)를 통과시켜 실제로 낸다.
@@ -517,46 +684,34 @@ class CoweekResidualEnv(gym.Env):
     def _features(self):
         lt = getattr(self.node, 'last_tick', None)
         if lt is None:
-            lt = {'speed': 0.0, 'steer': 0.0, 'aim': 0.0, 'mode': 'wait',
-                  'carea': 0.0, 'fmin': drv.LID_RANGE_MAX, 'lbias': 0.0,
-                  'dodging': False, 'sharp': False, 'crawl': False,
-                  'checker': False, 'arc_safe': 1.0, 'pass_hold': 0,
-                  'pass_side': 0.0, 'ncone': 0, 'band_px': 0, 'frame_t': None}
+            lt = dict(DEFAULT_LT)
         return lt
-
-    def _cap_onehot(self, lt):
-        return cap_onehot(lt)
 
     def _obs_row(self, lt):
         # 직전 행동을 함께 넣는다 (obs_row 독스트링 참조).
-        # step() 은 self._prev_a = a 를 **관측을 만들기 전에** 갱신하므로
-        # 여기 들어가는 값은 "방금 낸 행동"이다. reset() 에선 0 이다.
+        # step() 은 self._prev_a 를 **관측을 만들기 전에** 갱신하므로
+        # 여기 들어가는 값은 "방금 낸 행동"이다. reset()·텔레포트 직후엔 0 이다.
         return obs_row(lt, self._prev_a)
 
     def _stack(self, row):
-        """관측 지연은 여기서 준다 — **정책이 보는 것만** 늦어진다.
-
-        베이스 제어기는 자기 카메라를 그대로 쓴다. 이 지연이 상정하는 것은
-        정책 쪽 센싱·추론 파이프라인이고, 배포(`run_policy.py`)는 지연 0 이라
-        범위 하단(0)이 실제 배포 조건이다."""
-        self._raw.append(row)
-        self._raw = self._raw[-(HIST + 4):]
-        k = self.dyn.obs_delay
-        row = self._raw[-1 - k] if len(self._raw) > k else self._raw[0]
+        # 관측 지연 축은 제거됐다 (P1-2) — 항상 현재 row 다.
         self._hist.append(row)
         while len(self._hist) < HIST:
             self._hist.insert(0, row)
         self._hist = self._hist[-HIST:]
         return np.concatenate(self._hist).astype(np.float32)
 
-    def _teleport_to(self, i, lat=0.0, dyaw=0.0):
+    def _teleport_to(self, i, lat=0.0, dyaw=0.0, back=0.0):
         wx, wy = self.track.wp[i]
         ux, uy = self.track.u[i]
-        yaw = float(self.track.yaw[i]) + dyaw
-        api('/pose', {'x': float(wx + ux * lat), 'y': float(wy + uy * lat),
+        base_yaw = float(self.track.yaw[i])
+        yaw = base_yaw + dyaw
+        api('/pose', {'x': float(wx + ux * lat - math.cos(base_yaw) * back),
+                      'y': float(wy + uy * lat - math.sin(base_yaw) * back),
                       'yaw': yaw})
 
     def _wait_pose(self, timeout=2.0):
+        """가장 최근 pose (신선도 요구 없음 — 진단·테스트용)."""
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             p = self.poll.get()
@@ -565,11 +720,48 @@ class CoweekResidualEnv(gym.Env):
             time.sleep(0.02)
         return (0.0, 0.0, 0.0, {})
 
+    def _fresh_pose(self, seq0, timeout=2.0):
+        """`seq0` **이후에 새로 받은** pose 만 돌려준다 (P0-3).
+
+        제한 시간 안에 새 상태가 안 오면 그 전이를 만들지 않고 죽는다 —
+        낡은 상태로 정상 속도로 쓸모없는 전이를 쌓는 것이 조용한 실패의
+        뿌리다. 폴 주기 40 ms 에서 2 초는 폴 50 번이다."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            p, s = self.poll.get_seq()
+            if p is not None and s > seq0:
+                return p
+            time.sleep(0.004)
+        raise RuntimeError(
+            '상태 폴러가 %.1f 초 동안 새 pose 를 못 줬다 (seq %d 정지, 누적 실패 %d)'
+            ' — /state API 를 확인하라. 낡은 상태로 학습을 계속하지 않는다 (P0-3)'
+            % (timeout, seq0, self.poll.fail_n))
+
+    def _fresh_frame(self, t_after, hold, max_s=3.0):
+        """`t_after` 이후의 카메라 프레임이 last_tick 에 실릴 때까지 드라이버를
+        돌린다 (P0-4 — 텔레포트 전 장면으로 다음 행동을 만들지 않는다).
+
+        hold=True 면 그동안 차를 세워 둔다(리셋 경로). False 면 base 로
+        달린다 — 배포에서 텔레포트 직후 잔차가 0 으로 강제되는 구간과 같다.
+        (소비한 틱 수, last_tick) 을 반환한다. 틱 수는 시간 비용에 넣는다 —
+        심판의 시계는 그동안에도 돈다."""
+        n = 0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max_s:
+            self._spin_one_tick()
+            self._publish(0.0 if hold else self.cap.base)
+            n += 1
+            lt = self._features()
+            if lt['frame_t'] is not None and lt['frame_t'] > t_after:
+                return n, lt
+        raise RuntimeError('텔레포트 후 %.1f 초 동안 새 프레임이 없다 — 환경 고장'
+                           % max_s)
+
     # ── Gym API ────────────────────────────────────────────────────
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        # 과적합 방지: N 에피소드마다 cone6 를 뺀 콘을 다시 뿌린다.
+        # 과적합 방지: N 에피소드마다 pin 을 뺀 콘을 다시 뿌린다.
         # 재배치가 곧 정본 갱신이라 아래 복원 단계는 건너뛴다.
         self._ep += 1
         n_shuf = 0
@@ -587,15 +779,14 @@ class CoweekResidualEnv(gym.Env):
                 time.sleep(0.15)
 
         if self.start_at_line:
-            # **출발선에서 시작해 출발선에서 끝난다.** 랩 단위인데 시작점이
-            # 임의면 에피소드 경계가 눈에 보이는 출발선과 어긋나서, 도중에
-            # 결승선을 지나고 엉뚱한 지점에서 리셋·콘재배치가 일어난다
-            # (사용자가 화면에서 잡아낸 문제, 2026-08-21).
-            # 랩 하나가 이미 트랙 전체를 덮으므로 시작점을 흩뿌려 얻을
-            # 다양성도 없다 — 8 초 슬라이스 시절의 잔재였다.
+            # **출발선에서 시작해 공식 결승선에서 끝난다.** 심판처럼 출발선
+            # 0.10 m 뒤에 놓는다 (referee.py `one_run` 의 initialize 와 동일).
+            # 랩 하나가 트랙 전체를 덮으므로 시작점을 흩뿌려 얻을 다양성은
+            # 없고, 임의 시작이면 에피소드 경계가 화면·심판과 어긋난다.
             i = 0
             lat = float(self.rng.uniform(-0.10, 0.10))
             dyaw = float(self.rng.uniform(-0.10, 0.10))
+            back = 0.10
         else:
             # 스폰이 콘 위에 떨어지면 첫 스텝부터 가짜 히트가 난다.
             i = int(self.rng.integers(self.start_lo, self.start_hi))
@@ -609,38 +800,46 @@ class CoweekResidualEnv(gym.Env):
                 i = int(self.rng.integers(self.start_lo, self.start_hi))
                 lat = float(self.rng.uniform(-0.15, 0.15))
             dyaw = float(self.rng.uniform(-0.25, 0.25))
+            back = 0.0
         # 플랜트도 에피소드마다 다시 뽑는다. 텔레포트가 속도를 0 으로
         # 만드므로(실측) 액추에이터 상태도 0 에서 출발한다 — sample() 이 함께 한다.
         plant = self.dyn.sample(self.rng)
-        self._teleport_to(i, lat, dyaw)
+        self._teleport_to(i, lat, dyaw, back=back)
+        # 신선도 기준 시각은 API 가 **돌아온 뒤**다 — 적용 전에 도착한 이전
+        # 장면 프레임을 새 프레임으로 오인하지 않게
+        tele_t = time.monotonic()
         # 드라이버 내부 래치를 초기화 (텔레포트 안전).
         # **목록은 driver.py 의 v34c 텔레포트 핸들러와 정확히 같아야 한다**
         # (`jump > 45.0` 분기). 랩 시작은 출발선 -> 출발선이라 장면이 비슷해서
         # 그 자동 감지가 안 걸릴 수 있으므로 여기서 직접 지운다.
-        # 그쪽 주석: "stale frame-scale memory ... ~0.5 m drift on the fresh
-        # straight -> finish-miss cascade" — 우리가 쫓는 바로 그 병목이다.
         self.node.pass_hold = 0
         self.node.pass_side = 0.0
         self.node.sharp_lock = False
         self.node.last_steer = 0.0
         self.node.last_arc = None
         self._hist = []
-        self._raw = []
         self._prev_a = 0.0
-        self._hit_rearm = {}
-        time.sleep(0.12)                      # 새 프레임 도착 (실측 78 ms)
+        self._hit_state = {}
+        self.finish.reset()
 
-        # 워밍업: 베이스 제어기로만 달려 비영 속도 상태를 만든다.
-        # (정지출발 상태만 학습하면 인공적 가속 구간을 과학습한다)
-        for _ in range(self.warmup_steps):
+        # 워밍업: **차를 세워 둔 채** 새 프레임과 last_tick 만 채운다 (P1-7).
+        # 베이스로 미리 달리는 숨은 주행 구간은 두지 않는다 — 심판이 시간을
+        # 재는 구간이고, 배포(run_policy.py)에는 워밍업이 없다.
+        n0, lt = self._fresh_frame(tele_t, hold=True)
+        for _ in range(max(0, self.warmup_steps - n0)):
             self._spin_one_tick()
-            self._publish(self.cap.base)
-        p = self._wait_pose()
+            self._publish(0.0)
+        lt = self._features()
+        # 리셋 텔레포트로 v34c 가 발화했을 수 있다 — 여기서 흡수해 첫 스텝이
+        # 가짜 리셋을 미러링하지 않게 한다
+        self._tp_seen = int(lt.get('teleport_n', 0))
+
+        p = self._fresh_pose(self.poll.get_seq()[1])
         _, s, e, half = self.track.locate(p[0], p[1])
         self._s_prev = s
-        self._lap_s = 0.0          # 이번 에피소드에 실제로 나아간 arc 길이
+        self._lap_s = 0.0          # 진단값 (종료 판정에는 쓰지 않는다 — P0-1)
+        self._time_s = 0.0         # 공식 비용에 넣은 누적 시간
         self._t = 0
-        lt = self._features()
         return self._stack(self._obs_row(lt)), {'dyn': plant, 'reshuffled': n_shuf}
 
     def step(self, action):
@@ -648,82 +847,136 @@ class CoweekResidualEnv(gym.Env):
         res = a * RES_MAX
         base_used = self.cap.base          # 이번 명령이 실제로 얹힌 base
         cmd = float(np.clip(base_used + res, 0.0, V_HARD))
+        seq0 = self.poll.get_seq()[1]      # 행동 발행 전의 마지막 상태 seq
         cmd_out = self._publish(cmd)       # 플랜트 통과 후 실제로 나간 값
 
         self._spin_one_tick()
         self._t += 1
+        extra = 0                          # 페널티 회복에 쓴 추가 틱
 
-        p = self._wait_pose()
-        x, y, _yaw, objs = p[0], p[1], p[2], p[3]
-        _, s, e, half = self.track.locate(x, y)
+        p = self._fresh_pose(seq0)         # P0-3: 행동 이후의 새 상태만
+        x, y, yaw, objs = p
+        i_now, s, e, half = self.track.locate(x, y)
         ds = self.track.ds(self._s_prev, s)
 
-        off = abs(e) > half + OFF_MARGIN
-        # 히트는 심판과 **같은 기준** — 콘이 움직였는가(1 cm / 4 cm).
-        # 거리 기준은 차 중심만 봐서 앞·뒤 범퍼 접촉을 놓친다 (Cones 독스트링)
-        moved = self.cones.displaced(objs)
-        # 심판과 같은 latch+rearm: 복원이 전파되기 전 몇 스텝 동안 같은 콘이
-        # 계속 "움직인 상태"로 보이는데, 그걸 매번 새 히트로 세면 안 된다
-        now = time.monotonic()
-        fresh = [n for n in moved if now >= self._hit_rearm.get(n, 0.0)]
-        hit = bool(fresh)
-        for n in fresh:
-            self._hit_rearm[n] = now + CONE_REARM_S
+        # ── 공식 결승선 (P0-1). 심판 evaluate() 와 같은 순서 — 완주 틱은
+        # 페널티 처리 없이 즉시 끝난다 (심판이 그렇게 return 한다).
+        lap_done = self.lap_episode and self.finish.update(x, y, yaw)
 
-        # 랩 진행은 **보상과 따로** 센다. 보상 쪽 ds 는 순간이동 착취를 막으려고
-        # 0 으로 죽이지만, 랩이 끝났는지는 실제로 나아간 거리로 판단해야 한다.
+        off = hit = False
+        moved = []
+        fresh = []
+        if not lap_done:
+            # 심판과 **같은 메트릭**(최근접 wp 까지의 방사거리). 사영 |e| 로
+            # 재면 한 방향으로만 관대해진다 — Track.off_track 독스트링 참조
+            off = self.track.off_track(x, y)
+            # 히트는 심판과 **같은 기준** — 콘이 움직였는가(1 cm / 4 cm).
+            moved = self.cones.displaced(objs)
+            # latch+rearm 도 심판과 **같은 의미**여야 한다. 심판의 latch 는
+            # 시간이 지나면 풀리는 게 아니라 콘이 **제자리로 돌아온 것을 한 번
+            # 관측해야** 풀린다: rearm 이 지났는데 아직 움직여 있으면 복원만
+            # 하고 페널티는 주지 않는다. "1 초 지나면 재과금"으로 두면 복원이
+            # 늦거나 재접촉이 있을 때 심판이 절대 주지 않는 두 번째 +5 를
+            # 학습시킨다.
+            now = time.monotonic()
+            mset = set(moved)
+            for n in self.cones.base:
+                h = self._hit_state.get(n)
+                if h and h['latched']:
+                    if now < h['rearm']:
+                        continue
+                    if n not in mset:
+                        h['latched'] = False      # 제자리 확인 -> 재무장
+                        continue
+                    self.cones.restore(n)         # 아직 움직여 있다: 복원만
+                    h['rearm'] = now + CONE_REARM_S
+                    continue
+                if n in mset:
+                    self._hit_state[n] = {'latched': True,
+                                          'rearm': now + CONE_REARM_S}
+                    fresh.append(n)
+            hit = bool(fresh)
+
+        # 랩 진행(진단값)은 실제로 나아간 거리로 센다
         self._lap_s += min(max(ds, -0.5), 0.5)
-
-        # 텔레포트가 걸리는 스텝은 진행량을 0 으로 — 순간이동 착취 차단
+        # 텔레포트가 걸리는 스텝은 진행량 진단값을 0 으로 (순간이동 오염 방지)
         if off or hit or abs(ds) > 0.25:
             ds = 0.0
 
-        edge_room = (half + OFF_MARGIN) - abs(e)
-        buf = 0.04
-        b_edge = max(0.0, (buf - edge_room) / buf) ** 2
-        # 콘은 항상 정본으로 복원되므로 정본 거리 = 실제 거리다
-        cone_room = self.cones.clearance(x, y) - CONE_HIT_R
-        b_cone = max(0.0, (0.10 - cone_room) / 0.10) ** 2 if cone_room < 0.10 else 0.0
-
-        cost = (DT + P_OFF * off + P_CONE * hit
-                + DT * (W_EDGE * b_edge + W_CONEROOM * b_cone)
-                + W_SMOOTH * (a - self._prev_a) ** 2)
-        reward = W_SCALE * (K_PROG * ds - cost)
-
+        teleported = False
         if off or hit:
             # 심판과 같은 복구 — **콘도 제자리로.** 이걸 빠뜨려 22k 스텝을 버렸다
             for n in moved:
                 self.cones.restore(n)
-            # 그리고 차는 중심선 위 0.3 m 앞
-            i, _, _, _ = self.track.locate(x, y)
-            j = i
-            acc = 0.0
-            while acc < TELE_AHEAD:
-                j = (j + 1) % len(self.track.wp)
-                acc += float(np.linalg.norm(self.track.wp[j] - self.track.wp[j - 1]))
+            # 착지점도 심판과 같아야 한다 — 두 경우가 **다른 기준**을 쓴다:
+            #   이탈  -> 차 기준 최근접 wp 에서 0.3 m 앞 (move_to_center)
+            #   콘히트 -> **콘 기준** 최근접 wp 에서 0.3 m 앞. 차 기준으로 놓으면
+            #            전면 접촉 시 착지점이 심판보다 ~0.17 m 뒤라 복원된 콘
+            #            옆구리에 차가 걸친 채 출발한다 (재접촉 유발)
+            car_idx = (self.finish.last_idx if self.finish.last_idx is not None
+                       else i_now)
+            if hit:
+                b = self.cones.base[fresh[-1]]
+                src = self.track.nearest_idx_near(b['x'], b['y'], car_idx, 5, 20)
+            else:
+                src = self.track.nearest_idx_near(x, y, car_idx, 10, 15)
+            j = self.track.fwd_index(src, TELE_AHEAD)
+            seq1 = self.poll.get_seq()[1]
             self._teleport_to(j)
+            tele_t = time.monotonic()   # 신선도 기준은 API 반환 이후 (위 리셋과 동일)
             self.dyn.on_teleport()      # 텔레포트는 차를 세운다 — 모델도 세운다
-            time.sleep(0.10)
-            p = self._wait_pose()
-            _, s2, e, half = self.track.locate(p[0], p[1])
-            # 심판의 강제 이동도 트랙을 따라 앞으로 놓는다 — 랩 진행에 포함한다
+            self.finish.note_teleport()  # 심판도 페널티 후 prev 를 지운다
+            # P0-4: 새 장면이 올 때까지 base 로만 달린다 (배포의 잔차 0 구간).
+            # 이 틱들은 아래에서 시간 비용에 들어간다.
+            extra, _ = self._fresh_frame(tele_t, hold=False)
+            p2 = self._fresh_pose(seq1)
+            _, s2, e, half = self.track.locate(p2[0], p2[1])
+            # 심판의 강제 이동도 트랙을 따라 앞으로 놓는다 — 진행 진단에 포함
             self._lap_s += min(max(self.track.ds(s, s2), -0.5), 0.5)
             s = s2
+            teleported = True
+
+        # ── 보상 = 공식 비용 그대로 (P0-6). 정형·배리어 없음.
+        # ⚠️ 콘은 **개수만큼** 과금한다 — 심판은 콘마다 +5 를 주므로(콘 루프
+        # 안에서 `penalty += 5`), 한 틱에 두 개를 치면 심판은 +10 이다.
+        # `bool(hit)` 로 세면 그 차이만큼 정책이 무벌로 배운다 (전수검수 P2-5).
+        step_t = DT * (1 + extra)
+        self._time_s += step_t
+        cost = step_t + P_OFF * off + P_CONE * len(fresh)
+        reward = -W_SCALE * cost
 
         self._s_prev = s
         self._prev_a = a
         lt = self._features()
+        # P0-4: 텔레포트면 관측 히스토리·행동 이력을 리셋한다. driver v34c 가
+        # 스스로 감지한 텔레포트(teleport_n 증가)도 같은 리셋을 미러링한다 —
+        # 배포 러너(run_policy.py)와 같은 규칙이어야 학습/배포가 일치한다.
+        tp = int(lt.get('teleport_n', 0))
+        if teleported or tp != self._tp_seen:
+            self._hist = []
+            self._prev_a = 0.0
+        self._tp_seen = tp
         obs = self._stack(self._obs_row(lt))
-        lap_done = self.lap_episode and self._lap_s >= self.track.total
-        truncated = bool(lap_done or self._t >= self.episode_steps)
-        info = {'ds': ds, 'off': bool(off), 'hit': bool(hit), 'moved': moved,
+
+        # ── 종료 계약 (P0-2): 공식 완주 = terminated (부트스트랩 없음),
+        # 시간 안전망 = truncated (부트스트랩 있음)
+        if self.lap_episode:
+            timeout = (not lap_done) and self._time_s >= self.max_episode_s
+        else:
+            timeout = self._t >= self.episode_steps
+        terminated = bool(lap_done)
+        truncated = bool(timeout)
+        info = {'ds': ds, 'off': bool(off), 'hit': bool(hit),
+                'n_hit': len(fresh), 'moved': moved,
                 'base': base_used,          # cmd 가 얹힌 그 base
                 'base_next': self.cap.base,  # spin 이후의 새 base
                 'cmd': cmd, 'cmd_out': cmd_out, 'res': res, 'e': e,
-                'lap_s': self._lap_s, 'lap_done': bool(lap_done)}
+                'lap_s': self._lap_s, 'lap_done': bool(lap_done),
+                'timeout': bool(timeout), 't_s': self._time_s,
+                'extra_ticks': extra, 'adv': self.finish.adv}
         if self.log is not None:
             self.log.append(info)
-        return obs, float(reward), False, bool(truncated), info
+        return obs, float(reward), terminated, truncated, info
 
     def close(self):
         try:

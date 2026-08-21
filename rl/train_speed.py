@@ -19,9 +19,18 @@ PPO 는 on-policy 라 이 예산에서 불리하다.
 ## 동역학 랜덤화 (기본 ON — 사용자 승인 2026-08-21)
 이 시뮬은 구동계가 속도 소스라 **감속이 공짜다**(≥4.5 m/s² 실측). 그 위에서
 속도 잔차를 학습하면 정책은 "코너 직전까지 최고속 → 순간 감속" 을 배우고
-실차에서 그대로 죽는다. 그래서 에피소드마다 가감속 한계·조향 서보 각속도·
-구동/관측 지연을 다시 뽑는다. 근거·범위는 `rl/dyn.py`, 검증은 `rl/test_dyn.py`.
-끄려면 `--no-dyn` (참 플랜트 대조군용).
+실차에서 그대로 죽는다. 그래서 에피소드마다 가감속 한계·구동 지연을 다시
+뽑는다 (조향·관측 지연 축은 전수검수 P1-2/P1-4 로 제거됨). 근거·범위는
+`rl/dyn.py`, 검증은 `rl/test_dyn.py`. 끄려면 `--no-dyn` (참 플랜트 대조군용).
+
+## 계약 (2026-08-21 전수검수 반영)
+- 종료 = **공식 결승선** (심판 판정 이식, P0-1) → `terminated` (P0-2)
+- 보상 = **공식 비용 그대로** `-W(Δt + 5·off + 5·hit)`, K_PROG 없음 (P0-6)
+- gamma 기본 0.9995 — 0.995 는 유효 지평 ~10 초라 랩 스케일 사건(결승선)이
+  출발 부근 행동에 사실상 안 보였다 (터미널 가중치 0.0146)
+- 학습 콘 분포 = **평가와 동일** (P0-8): 랜덤 배치 + cone6 만 고정.
+  고정은 대회 규칙이 아니라 측정 전략이다 (미해결 병목을 테스트에 남긴다)
+이 계약 이전의 모델·리플레이 버퍼(s1~s6)는 **재사용하지 않는다.**
 
 ## 안전 장치
 - action 0 == 잔차 0 == racer-v64. 초기 정책이 베이스 근처에서 시작한다.
@@ -31,7 +40,10 @@ PPO 는 on-policy 라 이 예산에서 불리하다.
    전례가 이 프로젝트에 여러 건 있다).
 """
 import argparse
+import hashlib
+import json
 import os
+import subprocess
 import sys
 import time
 
@@ -43,8 +55,45 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
+import coweek_env as ce
 from coweek_env import CoweekResidualEnv
 from dyn import DYN_RANGES
+
+WS = '/home/physicar/physicar_ws'
+
+
+def write_manifest(out, args, status):
+    """모델 옆에 계약·환경 지문을 남긴다 (전수검수 P1-9 최소 구현).
+
+    SB3 zip 은 shape 만 지킨다 — driver 상수·관측 의미·잔차 스케일이 바뀐
+    모델은 정상 로드되어 조용히 오작동한다. eval_policy.py 가 이 파일로
+    driver md5 와 완료 상태를 대조한다."""
+    try:
+        commit = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'],
+                                cwd=os.path.join(WS, 'coweek'),
+                                capture_output=True, text=True).stdout.strip()
+    except Exception:
+        commit = ''
+    def _md5(rel):
+        return hashlib.md5(
+            open(os.path.join(WS, rel), 'rb').read()).hexdigest()
+    import gymnasium
+    import stable_baselines3 as sb3
+    m = {'status': status,                       # READY / INCOMPLETE
+         'contract': ce.CONTRACT,
+         'git_commit': commit,
+         'driver_md5': _md5('coweek/driver.py'),
+         # arc_planner 도 관측 의미의 일부다 (aim·arc_safe·mode 가 그쪽 산물)
+         'arc_md5': _md5('coweek/arc_planner.py'),
+         'obs_row_dim': ce.OBS_ROW_DIM, 'hist': ce.HIST,
+         'res_max': ce.RES_MAX, 'v_hard': ce.V_HARD,
+         'gamma': args.gamma, 'steps': args.steps,
+         'dyn': not args.no_dyn, 'dyn_ranges': DYN_RANGES,
+         'cone_pin': args.cone_pin, 'cone_reshuffle': args.cone_reshuffle,
+         'sb3': sb3.__version__, 'gymnasium': gymnasium.__version__,
+         'python': sys.version.split()[0], 't': time.time()}
+    with open(os.path.join(args.out, 'manifest.json'), 'w') as f:
+        json.dump(m, f, indent=1)
 
 
 class Progress(BaseCallback):
@@ -59,7 +108,8 @@ class Progress(BaseCallback):
         self.ds = 0.0
         self.lag = 0.0          # |명령 - 실제로 나간 값| 누적
         self.n = 0
-        self.laps = 0           # 완주한 바퀴 수
+        self.laps = 0           # 공식 결승선 완주 수
+        self.timeouts = 0       # 150 초 안전망에 걸린 에피소드 수
 
     def _on_step(self):
         info = self.locals.get('infos', [{}])[0]
@@ -67,6 +117,7 @@ class Progress(BaseCallback):
         self.hit += int(info.get('hit', False))
         self.ds += float(info.get('ds', 0.0))
         self.laps += int(info.get('lap_done', False))
+        self.timeouts += int(info.get('timeout', False))
         if 'cmd_out' in info:
             self.lag += abs(float(info['cmd']) - float(info['cmd_out']))
             self.n += 1
@@ -74,11 +125,11 @@ class Progress(BaseCallback):
             el = time.time() - self.t0
             # `plant` 은 랜덤화가 실제로 물고 있는지 보는 위생 지표다.
             # dyn 을 켰는데 0.000 이면 배선이 끊긴 것이다.
-            print('[%7d] %5.1f min | %.1f steps/s | 랩 %d | ds %.1f m'
+            print('[%7d] %5.1f min | %.1f steps/s | 랩 %d (TO %d) | ds %.1f m'
                   ' | off %d | hit %d | plant %.3f m/s'
                   % (self.num_timesteps, el / 60.0,
                      self.num_timesteps / max(el, 1e-9), self.laps,
-                     self.ds, self.off, self.hit,
+                     self.timeouts, self.ds, self.off, self.hit,
                      self.lag / max(self.n, 1)), flush=True)
         return True
 
@@ -95,13 +146,16 @@ def main():
                          '1.2 정도가 필요하다 (가짜 정지출발 편향 제거용)')
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--batch', type=int, default=256)
-    ap.add_argument('--gamma', type=float, default=0.995)
+    # 0.9995 @20Hz -> 유효 지평 약 100 초 = 랩 스케일. 0.995(~10 초)는 결승선
+    # 결과가 출발 부근 행동에 안 보였다 (전수검수 P0-6 의 산술)
+    ap.add_argument('--gamma', type=float, default=0.9995)
     ap.add_argument('--tau', type=float, default=0.01)
     ap.add_argument('--learning-starts', type=int, default=2000)
-    # UTD(update-to-data). 데이터 수집이 실시간 시뮬에 하드 캡(18.6 steps/s)돼
-    # 있는데 GPU 는 3 % 다 — 같은 54분 동안 학습 횟수만 늘릴 수 있는 유일한
-    # 레버다. 다만 높은 UTD 는 SAC 의 Q 과대추정을 키우므로 올릴 때는
-    # 반드시 A/B 로 재라 (GPT 검수 Q3 으로 넘긴 항목).
+    # UTD(update-to-data)는 **올리지 마라** (전수검수 P1-1, 확정): SB3 는 env
+    # 스텝 사이에 train() 을 동기 호출하고 ROS 스핀은 env 안에서만 돈다 —
+    # gradient_steps 를 올리면 제어 주기가 밀려 수집 플랜트 자체가 바뀐다.
+    # 제어 주기 저하는 결승선 놓침을 3%→23% 로 터뜨리는 것이 실측돼 있다.
+    # GPU 가 놀면 스텝 수(--steps)를 늘려라 — 신선한 데이터가 항상 더 낫다.
     ap.add_argument('--gradient-steps', type=int, default=1)
     ap.add_argument('--train-freq', type=int, default=1)
     ap.add_argument('--device', default='cuda')
@@ -109,18 +163,21 @@ def main():
                     help='랩 단위 에피소드를 끄고 --episode-s 초 슬라이스로 돈다. '
                          '기본은 랩 — 평가가 한 바퀴라 학습도 한 바퀴여야 '
                          '분포가 맞고, 결승선 접근은 랩 스케일 사건이다')
-    ap.add_argument('--max-episode-s', type=float, default=150.0,
-                    help='랩 모드 안전망: 차가 멈춰도 이 시간이면 끊는다')
+    ap.add_argument('--max-episode-s', type=float, default=180.0,
+                    help='랩 모드 안전망 = 심판 TIME_LIMIT 과 동일(180). 차가 '
+                         '멈추거나 결승선을 계속 놓쳐도 이 시간이면 끊는다')
     ap.add_argument('--start-anywhere', action='store_true',
                     help='랩을 트랙 임의 지점에서 시작한다. 기본은 출발선 — '
                          '임의 지점이면 에피소드 경계가 눈에 보이는 출발선과 '
                          '어긋나 도중에 리셋·콘재배치가 일어나는 것처럼 보인다')
     ap.add_argument('--cone-reshuffle', type=int, default=1,
-                    help='N 에피소드마다 cone6 를 뺀 콘 5개를 다시 뿌린다 '
-                         '(0 = 예선맵 고정). 과적합 방지 — 생성기는 심판의 '
-                         'random_cone_layout 을 그대로 쓴다')
+                    help='N 에피소드마다 콘을 다시 뿌린다 (0 = 예선맵 고정). '
+                         '생성기는 심판의 random_cone_layout 을 그대로 쓴다')
     ap.add_argument('--cone-pin', default='cone6',
-                    help='재배치에서 제외할 콘 (쉼표 구분, 빈 문자열이면 전부 랜덤)')
+                    help='재배치에서 제외할 콘 (쉼표 구분). 기본 cone6 — 대회 '
+                         '규칙이 아니라 측정 전략이다(미해결 병목이라 흩어버리면 '
+                         '성적이 좋아 보인다). eval_policy --finals 도 같은 '
+                         "분포를 쓴다 (P0-8). 전부 랜덤은 --cone-pin ''")
     ap.add_argument('--resume', default='',
                     help='기존 zip 에서 이어서 학습한다. 같은 이름의 '
                          '_buffer.pkl 이 있으면 리플레이 버퍼도 복원한다. '
@@ -183,7 +240,7 @@ def main():
             learning_rate=a.lr,
             buffer_size=300_000,
             batch_size=a.batch,
-            gamma=a.gamma,          # 0.995 @20Hz -> 유효 지평 약 10 초
+            gamma=a.gamma,          # 기본 0.9995 @20Hz -> 유효 지평 약 100 초
             tau=a.tau,
             train_freq=a.train_freq,
             gradient_steps=a.gradient_steps,
@@ -202,9 +259,12 @@ def main():
              a.gradient_steps / max(a.train_freq, 1)), flush=True)
     print('학습 시작 — 목표 %d 스텝 (20 Hz 기준 약 %.1f 시간)'
           % (a.steps, a.steps / 72000.0), flush=True)
+    write_manifest(a.out, a, 'INCOMPLETE')
+    completed = False
     try:
         model.learn(total_timesteps=a.steps, callback=[ck, Progress()],
                     log_interval=10, reset_num_timesteps=not bool(a.resume))
+        completed = True
     finally:
         final = os.path.join(a.out, 'final')
         model.save(final)
@@ -214,7 +274,11 @@ def main():
         except Exception as e:
             print('버퍼 저장 실패(무시):', e, flush=True)
         env.close()
-        print('저장 완료:', final + '.zip')
+        # 죽다 저장된 final.zip 이 "완료된 학습"처럼 보이면 안 된다 (P2-2).
+        # eval_policy.py 는 READY 가 아니면 평가를 거부한다.
+        write_manifest(a.out, a, 'READY' if completed else 'INCOMPLETE')
+        print('저장 완료: %s.zip (status=%s)'
+              % (final, 'READY' if completed else 'INCOMPLETE'), flush=True)
 
 
 if __name__ == '__main__':

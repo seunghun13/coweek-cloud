@@ -16,19 +16,30 @@
 **콘 위치만 랜덤화해서는 이 계통 오차를 못 막는다.** 도메인 랜덤화는
 랜덤화한 축에 대해서만 효과가 있다. 그래서 축을 명시적으로 고른다.
 
-## 무엇을 흔드는가 (3축, 사용자 승인 2026-08-21)
+## 무엇을 흔드는가 (속도 축만 — 2026-08-21 전수검수 반영)
 | 축 | 범위 | 시뮬 참값 | 근거 |
 |---|---|---|---|
 | 가속 한계 | 1.5~9.0 m/s² | 사실상 무한 (≥4.5 실측) | 실차 모터 토크 한계 |
 | 감속 한계 | 1.0~9.0 m/s² | 〃 | 코스트다운은 가속보다 느리다 |
-| 조향 서보 각속도 | 3~12 rad/s | 10 (physicar-ros *"Limit steering joint velocity to 10"*) | 서보 부하·전압 |
 | 구동 지연 | 0~3 틱 (0~150 ms) | 0 | 시리얼·ESC 지연 |
-| 관측 지연 | 0~2 틱 (0~100 ms) | 0 | 카메라 파이프라인 |
 
 가속·감속을 **따로 뽑는다** — 실차는 미는 힘과 멈추는 힘이 다르다.
 
-**범위 상단이 시뮬 참값을 포함한다.** 참 플랜트가 학습 분포 안에 있어야
-정책이 지금 성적을 통째로 버리지 않는다. 하단은 실차 열화를 상정한 값이다.
+### 제거된 축 (GPT 전수검수 P1-2 / P1-4 / Q8·Q9, 2026-08-21)
+- **관측 지연**: 정책 관측 row 전체를 과거로 바꾸는 방식은 내부 모순이었다 —
+  `prev_a`(자기 행동 이력)와 `frame_age` 까지 과거가 되고, 정책은 과거 base 를
+  보는데 잔차는 현재 base 에 얹혔다. 실제 카메라 지연이면 베이스 제어기도
+  같이 늦어야 하고, 정책 추론 지연이면 관측이 아니라 **행동 적용**이 늦어야
+  한다. 실차(8/25)에서 각 구간 지연을 실측한 뒤 맞는 위치에 다시 모델링한다.
+- **조향 서보 각속도 + 조향 지연**: 1단계 정책은 속도 잔차만 내고 실제 조향
+  출력을 관측하지도 못하므로, 이 축은 학습에 보수성·분산만 만든다. 조향
+  잔차(2단계)와 실차 실측 뒤에만 다시 연다.
+
+## 범위에 대한 정직한 주석 (P1-3, 미해결로 남긴다)
+가감속 상단 9.0 은 시뮬 참값("사실상 무한", 한 틱 완전 추종에는 18 m/s² 필요)을
+**포함하지 않는다.** 연속 uniform 분포라 nominal passthrough 는 분포 안에 없다.
+범위 재설정은 8/25 실차 step response 실측 후에만 의미가 있어 지금은 유지한다
+(사용자 승인 범위, v71). 평가·배포는 어차피 참 플랜트다.
 
 ## 어디에 안 켜는가
 `run_policy.py`(배포)와 `eval_policy.py`(공식 채점)는 **참 플랜트**를 그대로
@@ -38,35 +49,28 @@
 `enabled=False` 면 전 경로가 **순수 통과**다 (`test_dyn.py` 가 검증한다).
 `NOMINAL` 파라미터(무한 가속 / 0 지연)로 켜도 마찬가지로 순수 통과다 —
 랜덤화 배선 자체가 동작을 바꾸지 않음을 이 성질로 확인할 수 있다.
-
-## 다음 후보 축 (지금은 안 넣는다)
-모터 게인 오차(`v_gain`), 조향 트림 바이어스. 둘 다 실차에서 실재하지만
-**1차원 속도 잔차로는 보상할 수 없는 축**이라 보상 신호에 잡음만 더한다.
-조향 잔차(2단계)를 붙일 때 같이 열 것.
 """
 from collections import deque
 
 # 각 축의 (하한, 상한). 상한 = 시뮬 참값 쪽, 하한 = 실차 열화 쪽.
 DYN_RANGES = {
-    'accel':      (1.5, 9.0),      # m/s^2
-    'decel':      (1.0, 9.0),      # m/s^2
-    'steer_rate': (3.0, 12.0),     # rad/s
-    'act_delay':  (0, 3),          # ticks (20 Hz -> 0~150 ms)
-    'obs_delay':  (0, 2),          # ticks (20 Hz -> 0~100 ms)
+    'accel':     (1.5, 9.0),      # m/s^2
+    'decel':     (1.0, 9.0),      # m/s^2
+    'act_delay': (0, 3),          # ticks (20 Hz -> 0~150 ms), 속도 명령에만
 }
 
-# 참 플랜트 = 무한 가감속 / 무한 서보 / 무지연. 이 값이면 켜져 있어도 통과다.
+# 참 플랜트 = 무한 가감속 / 무지연. 이 값이면 켜져 있어도 통과다.
 NOMINAL = {
-    'accel': float('inf'), 'decel': float('inf'),
-    'steer_rate': float('inf'), 'act_delay': 0, 'obs_delay': 0,
+    'accel': float('inf'), 'decel': float('inf'), 'act_delay': 0,
 }
 
 
 class Dyn:
-    """에피소드 단위로 플랜트를 다시 뽑고, 틱 단위로 명령을 통과시킨다.
+    """에피소드 단위로 플랜트를 다시 뽑고, 틱 단위로 속도 명령을 통과시킨다.
 
     지연을 먼저 걸고 그 다음에 가감속 한계를 적용한다 — 전송이 먼저이고
     액추에이터 응답이 나중이라는 물리 순서 그대로다.
+    조향은 건드리지 않는다 (모듈 독스트링의 "제거된 축" 참조).
     """
 
     def __init__(self, dt, enabled=True, ranges=None):
@@ -86,38 +90,27 @@ class Dyn:
             self.p = {
                 'accel': float(rng.uniform(*r['accel'])),
                 'decel': float(rng.uniform(*r['decel'])),
-                'steer_rate': float(rng.uniform(*r['steer_rate'])),
                 'act_delay': int(rng.integers(r['act_delay'][0],
                                               r['act_delay'][1] + 1)),
-                'obs_delay': int(rng.integers(r['obs_delay'][0],
-                                              r['obs_delay'][1] + 1)),
             }
         else:
             self.p = dict(NOMINAL)
         self.reset_state()
         return dict(self.p)
 
-    def reset_state(self, v0=0.0, steer0=0.0):
+    def reset_state(self, v0=0.0):
         """액추에이터 상태 초기화. 텔레포트는 속도를 0 으로 만든다(실측)."""
         self.v_act = float(v0)
-        self.st_act = float(steer0)
         n = int(self.p['act_delay']) + 1
         self.v_q = deque([float(v0)] * n, maxlen=n)
-        self.st_q = deque([float(steer0)] * n, maxlen=n)
 
     def on_teleport(self):
-        """심판 텔레포트는 차를 **세운다**(실측). 구동 액추에이터만 0 으로
+        """심판 텔레포트는 차를 **세운다**(실측). 구동 액추에이터를 0 으로
         되돌린다 — 이걸 안 하면 텔레포트 직후 한 틱이 가속 한계를 우회해
-        (모델 v_act 는 0.9 인데 차는 0) 랜덤화에 구멍이 생긴다.
-
-        조향 서보는 건드리지 않는다. 차가 옮겨져도 서보 각도는 유지된다."""
+        (모델 v_act 는 0.9 인데 차는 0) 랜덤화에 구멍이 생긴다."""
         self.v_act = 0.0
         n = self.v_q.maxlen
         self.v_q = deque([0.0] * n, maxlen=n)
-
-    @property
-    def obs_delay(self):
-        return int(self.p['obs_delay'])
 
     # ── 틱 ──────────────────────────────────────────────────────────
     def speed(self, target):
@@ -131,21 +124,10 @@ class Dyn:
         self.v_act = min(hi, max(lo, tgt))
         return float(self.v_act)
 
-    def steer(self, target):
-        """/steering 명령 하나를 서보 각속도 한계에 통과시킨다."""
-        if not self.enabled:
-            return float(target)
-        self.st_q.append(float(target))
-        tgt = self.st_q[0]
-        m = self.p['steer_rate'] * self.dt
-        self.st_act = min(self.st_act + m, max(self.st_act - m, tgt))
-        return float(self.st_act)
-
     # ── 로깅 ────────────────────────────────────────────────────────
     def summary(self):
         if not self.enabled:
             return 'dyn OFF (참 플랜트)'
         p = self.p
-        return ('dyn a%.1f/d%.1f m/s² · servo %.1f rad/s · act %d · obs %d 틱'
-                % (p['accel'], p['decel'], p['steer_rate'],
-                   p['act_delay'], p['obs_delay']))
+        return ('dyn a%.1f/d%.1f m/s² · act %d 틱'
+                % (p['accel'], p['decel'], p['act_delay']))

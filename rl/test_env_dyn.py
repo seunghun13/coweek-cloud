@@ -40,10 +40,10 @@ def episode(env):
     rows = []
     prev = float(env.dyn.v_act)          # 워밍업 직후의 액추에이터 상태
     for _ in range(env.episode_steps):
-        _, _, _, trunc, info = env.step(ZERO)
+        _, _, term, trunc, info = env.step(ZERO)
         rows.append((prev, info))
         prev = float(env.dyn.v_act)      # 텔레포트가 걸리면 여기서 0 이 된다
-        if trunc:
+        if term or trunc:                # 완주(terminated)도 에피소드 끝이다
             break
     return plant, rows
 
@@ -163,9 +163,13 @@ check('E4 콘이 정본으로 복원됐다', d <= CONE_MOVE_TOL, '잔여 %.4f m'
 check('E5 다른 콘은 안 건드렸다', env.cones.displaced(objs) == [],
       '%s' % env.cones.displaced(objs))
 
-# ── TEST F  콘 재배치 (과적합 방지) ─────────────────────────────────
-print('\n=== TEST F  콘 재배치 — cone6 고정, 5개 랜덤 ===', flush=True)
+# ── TEST F  콘 재배치 — 랜덤 + cone6 고정 (측정 전략) ─────────────
+print('\n=== TEST F  콘 재배치 — 랜덤 5개 + cone6 고정 ===', flush=True)
 home = {n: (p['x'], p['y']) for n, p in env.cones.home.items()}
+# 기본 pin = cone6. **대회 규칙이 아니라 측정 전략**이다 — 미해결 병목을
+# 테스트에 남긴다. eval_policy --finals 도 같은 분포를 써야 한다 (P0-8).
+check('F0 기본 pin 이 cone6 (평가와 같은 분포)', env.cones.pin == ('cone6',),
+      'pin=%s' % (env.cones.pin,))
 layouts = []
 for k in range(3):
     n_shuf = env.cones.reshuffle(env.rng)
@@ -173,14 +177,15 @@ for k in range(3):
     layouts.append(tuple(sorted((n, round(x, 3), round(y, 3))
                                 for n, (x, y) in cur.items())))
     if k == 0:
-        check('F1 5개를 배치한다 (cone6 제외)', n_shuf == 5, 'n=%d' % n_shuf)
+        check('F2 기본 분포는 5개만 배치 (cone6 제외)', n_shuf == 5,
+              'n=%d' % n_shuf)
         d6 = _m.hypot(cur['cone6'][0] - home['cone6'][0],
                       cur['cone6'][1] - home['cone6'][1])
-        check('F2 cone6 는 예선맵 자리 그대로', d6 <= CONE_MOVE_TOL,
+        check('F2b cone6 는 예선맵 자리 그대로', d6 <= CONE_MOVE_TOL,
               '이동 %.4f m' % d6)
-        movedn = [n for n in cur
-                  if _m.hypot(cur[n][0] - home[n][0],
-                              cur[n][1] - home[n][1]) > 0.05]
+        movedn = [n for n in cur if n != 'cone6'
+                  and _m.hypot(cur[n][0] - home[n][0],
+                               cur[n][1] - home[n][1]) > 0.05]
         check('F3 나머지 5개는 실제로 움직였다', len(movedn) == 5,
               '움직인 콘 %s' % sorted(movedn))
 check('F4 매번 다른 배치가 나온다', len(set(layouts)) == 3,
@@ -189,40 +194,52 @@ objs_f = {n: p for n, p in api('/state').get('objects', {}).items()
           if n.startswith('cone')}
 check('F5 재배치 직후 가짜 히트가 없다', env.cones.displaced(objs_f) == [],
       '%s' % env.cones.displaced(objs_f))
+# 6개 전부 랜덤은 **옵션**으로만 남는다 (더 어려운 스트레스 분포)
+env.cones.pin = ()
+check('F6 pin 을 비우면 6개 전부 랜덤 (옵션)',
+      env.cones.reshuffle(env.rng) == 6)
+env.cones.pin = ('cone6',)               # 본선 분포로 복귀
 
 # ── TEST G  랩 단위 에피소드 — 한 바퀴를 실제로 돈다 ───────────────
 # 사용자 지시(2026-08-21): 이탈·콘히트가 나도 에피소드를 끊지 말고 한 바퀴를
 # 계속 돌아야 한다. 평가가 랩이므로 학습도 랩이어야 분포가 맞는다.
+# ⚠️ G1 은 이제 **공식 결승선 판정**(P0-1)과 종료 계약(P0-2)을 함께 잰다:
+# 완주는 terminated 로 끝나야 하고, lap_done 은 앞점이 결승 선분을 실제로
+# 교차했다는 뜻이다 (누적 arc 도달이 아니라).
 print('\n=== TEST G  랩 단위 에피소드 (실제 한 바퀴, 약 1분) ===', flush=True)
 env.lap_episode = True
 env.start_at_line = True
 env.episode_steps = int(150.0 / DT)
 env.reset()
-# 출발선(wp0)에서 시작해야 에피소드 경계가 화면·심판과 일치한다
-# 유클리드 거리가 아니라 **arc 위치**로 잰다. 리셋은 wp0 에 놓지만 워밍업
-# 1.2 초가 최대 1.08 m 를 더 가므로, 출발선 기준 arc 가 작으면 통과다.
-# (임의 지점 시작이면 arc 기대값이 트랙 길이의 절반인 15 m 라 확실히 갈린다)
+# 출발선에서 시작해야 에피소드 경계가 화면·심판과 일치한다. 리셋은 심판처럼
+# 출발선 0.10 m **뒤**에 세워 두고(P1-7 — 워밍업은 정지 상태로 프레임만
+# 채운다), 주행은 첫 step 부터다. arc 는 출발선 직전(음수쪽)이어야 한다.
 p_start = env._wait_pose()
 _, s_start, _, _ = env.track.locate(p_start[0], p_start[1])
 s_signed = s_start if s_start < env.track.total / 2 else s_start - env.track.total
-check('G0 랩이 출발선에서 시작한다', -0.5 < s_signed < 2.0,
-      'arc %+.3f m (워밍업 1.2 초 포함, 임의 시작이면 기대값 15 m)' % s_signed)
+check('G0 랩이 출발선(0.1 m 뒤 정지)에서 시작한다', -0.5 < s_signed < 0.5,
+      'arc %+.3f m (임의 시작이면 기대값 15 m)' % s_signed)
 steps, offs, hits, first_pen, last = 0, 0, 0, None, None
+term = trunc = False
 while steps < env.episode_steps:
-    _, _, _, trunc, last = env.step(ZERO)
+    _, _, term, trunc, last = env.step(ZERO)
     steps += 1
     offs += int(last['off'])
     hits += int(last['hit'])
     if first_pen is None and (last['off'] or last['hit']):
         first_pen = steps
-    if trunc:
+    if term or trunc:
         break
-check('G1 랩 완료로 끝났다 (시간초과 아님)', bool(last and last['lap_done']),
-      'steps=%d lap_s=%.2f' % (steps, last['lap_s'] if last else -1))
-check('G2 진행 arc >= 트랙 길이', bool(last and last['lap_s'] >= env.track.total),
+check('G1 공식 결승선 완주 = terminated', bool(term and last['lap_done']),
+      'term=%s trunc=%s adv=%s' % (term, trunc, last.get('adv')))
+check('G1b 완주가 truncated 가 아니다 (P0-2)', not trunc,
+      'SB3 가 완주를 timeout 으로 보면 부트스트랩한다')
+check('G2 진행 arc >= 트랙 길이', bool(last and last['lap_s'] >= env.track.total - 0.3),
       'lap_s %.2f / total %.2f' % (last['lap_s'], env.track.total))
+check('G2b 어드밴스가 심판 조건을 만족', last.get('adv', 0) > env.track.N / 2,
+      'adv %s / N %d' % (last.get('adv'), env.track.N))
 check('G3 랩 소요가 그럴듯하다 (30~120 초)', 600 <= steps <= 2400,
-      '%d 스텝 = %.1f 초' % (steps, steps * DT))
+      '%d 스텝 = %.1f 초 (t_s %.1f)' % (steps, steps * DT, last.get('t_s', -1)))
 if first_pen is not None:
     check('G4 페널티가 에피소드를 끊지 않는다', steps > first_pen + 5,
           '첫 페널티 %d 스텝 -> 총 %d 스텝 (off %d, hit %d)'

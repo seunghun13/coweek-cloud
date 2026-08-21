@@ -3,7 +3,7 @@
 
     . /opt/physicar/src/physicar-ros/deploy/sim/bashrc-append
     cd ~/physicar_ws/coweek
-    python3 rl/quick_gate.py --model rl/runs/s6/final.zip --episodes 8
+    python3 rl/quick_gate.py --model rl/runs/s7/final.zip --episodes 8
 
 ## 이건 채택 근거가 **아니다**
 이 프로젝트에서 오프라인 지표가 역대 최고를 찍고 배치에서 2.2~6.7 초 손해를 낸
@@ -11,16 +11,25 @@
 공식 심판 게이트로만 한다 — 기준은 `README.md` 8b 장에 미리 못박아 뒀다.
 
 ## 그래도 필요한 이유
-공식 게이트는 예선·본선 두 조건에 각 30런이라 **약 70분**이다. 정책이 잔차 0보다
-**나쁜지**를 가리는 데 70분을 쓸 이유가 없다. 이건 그 앞단의 몇 분짜리 체다.
+공식 게이트는 예선·본선 두 조건에 각 15런 × 2 arm 이라 **약 70분**이다. 정책이
+잔차 0보다 **나쁜지**를 가리는 데 70분을 쓸 이유가 없다. 이건 그 앞단의
+십수 분짜리 체다.
 
-## 왜 "짝지어" 비교하나
-`reset(seed=S)` 가 env 의 rng 를 통째로 다시 깐다. 그래서 같은 S 를 두 arm 에
-주면 **콘 배치 · 플랜트 · 스폰 위치가 완전히 동일**해진다. 본선 배치의 편차가
-같은 빌드에서 페널티 130/170/200 을 만드는 이 프로젝트에서, 짝짓기는 사치가
-아니라 필수다.
+## 무엇을 재나 (전수검수 P0-7 반영)
+종전 비용 `5·(off+hit) − 진행거리` 는 **랩 시간을 안 쟀다** — 완주끼리는
+진행거리가 같아서 40초 정책과 60초 정책이 같은 점수를 받았다 (s6 의 "무차이"
+가 그렇게 나온 수치다). 이제 에피소드가 공식 결승선으로 끝나고 환경이 공식
+시간(`t_s`, 페널티 회복 틱 포함)을 재므로, 심판과 같은 구조의 점수를 쓴다:
+
+    score = t_s + 5·(off + hit)          (낮을수록 좋다)
+
+seed 별로 정책·기준선을 **짝지어** 차이 d_i = 정책_i − 기준_i 를 본다.
+`reset(seed=S)` 가 env 의 rng 를 통째로 다시 깔아 같은 S 면 콘 배치·플랜트·
+스폰이 완전히 동일하다. 본선 배치 편차(같은 빌드 페널티 130/170/200)를
+상쇄하는 유일한 방법이다.
 """
 import argparse
+import statistics as st
 import sys
 import os
 
@@ -34,36 +43,38 @@ from coweek_env import CoweekResidualEnv, RES_MAX
 ZERO = np.zeros(1, np.float32)
 
 
-def run_arm(env, model, seeds):
-    """각 seed 로 한 에피소드씩. model=None 이면 잔차 0."""
-    ds = off = hit = 0.0
-    res_abs, res_sum, n = 0.0, 0.0, 0
-    for s in seeds:
-        obs, _ = env.reset(seed=int(s))
-        for _ in range(env.episode_steps):
-            if model is None:
-                a = ZERO
-            else:
-                a, _ = model.predict(obs, deterministic=True)
-            obs, _r, _term, trunc, info = env.step(a)
-            ds += info['ds']
-            off += int(info['off'])
-            hit += int(info['hit'])
-            res_abs += abs(info['res'])
-            res_sum += info['res']
-            n += 1
-            if trunc:
-                break
-    return {'ds': ds, 'off': int(off), 'hit': int(hit), 'n': n,
-            'res_abs': res_abs / max(n, 1), 'res_mean': res_sum / max(n, 1)}
+def run_episode(env, model, seed):
+    """seed 하나로 한 에피소드. 공식 구조의 점수를 돌려준다."""
+    obs, _ = env.reset(seed=int(seed))
+    off = hit = 0
+    res_abs = 0.0
+    n = 0
+    term = trunc = False
+    info = {}
+    while not (term or trunc):
+        if model is None:
+            a = ZERO
+        else:
+            a, _ = model.predict(obs, deterministic=True)
+        obs, _r, term, trunc, info = env.step(a)
+        off += int(info['off'])
+        hit += int(info['n_hit'])      # 심판처럼 콘 개수로 (P2-5)
+        res_abs += abs(info['res'])
+        n += 1
+    return {'t_s': info.get('t_s', 0.0),
+            'off': off, 'hit': hit,
+            'finished': bool(term),
+            'timeout': bool(trunc and not term),
+            'score': info.get('t_s', 0.0) + 5.0 * (off + hit),
+            'res_abs': res_abs / max(n, 1)}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', required=True)
     ap.add_argument('--episodes', type=int, default=8,
-                    help='arm 당 랩 수. 랩이 약 45 초라 8 이면 두 arm 합쳐 '
-                         '약 12 분이다')
+                    help='seed(=짝) 수. 랩이 약 50 초라 8 이면 두 arm 합쳐 '
+                         '약 15 분이다')
     ap.add_argument('--seed0', type=int, default=90000)
     ap.add_argument('--dyn', action='store_true',
                     help='동역학 랜덤화를 켜고 잰다. **기본은 끔** — 이 도구는 '
@@ -79,34 +90,41 @@ def main():
                             cone_reshuffle=a.cone_reshuffle)
     model = SAC.load(a.model, device='cpu')
     seeds = [a.seed0 + k for k in range(a.episodes)]
-    print('짝지은 %d 랩 × 2 arm · 동역학 랜덤화 %s · 콘 재배치 %s'
+    print('짝지은 %d 쌍 · 동역학 랜덤화 %s · 콘 재배치 %s (pin 없음 = 본선 분포)'
           % (a.episodes, 'ON' if a.dyn else 'OFF (참 플랜트)',
              ('%d 랩마다' % a.cone_reshuffle) if a.cone_reshuffle else 'OFF'),
           flush=True)
+    pairs = []
     try:
-        pol = run_arm(env, model, seeds)
-        base = run_arm(env, None, seeds)
+        # seed 마다 정책 → 기준선 순으로 붙여 돈다. arm 을 통째로 나누면
+        # 시뮬 상태 드리프트가 한쪽 arm 에만 실릴 수 있다.
+        for s in seeds:
+            pol = run_episode(env, model, s)
+            base = run_episode(env, None, s)
+            pairs.append((s, pol, base))
+            print('  seed %d | 정책 %6.2f (t %5.1f, off %d, hit %d%s) | '
+                  '기준 %6.2f (t %5.1f, off %d, hit %d%s) | d %+6.2f'
+                  % (s, pol['score'], pol['t_s'], pol['off'], pol['hit'],
+                     ', TIMEOUT' if pol['timeout'] else '',
+                     base['score'], base['t_s'], base['off'], base['hit'],
+                     ', TIMEOUT' if base['timeout'] else '',
+                     pol['score'] - base['score']), flush=True)
     finally:
         env.close()
 
-    # 페널티는 공식 계수(5 초)로 환산, 진행량은 K_PROG=1.0 s/m 그대로
-    def cost(r):
-        return 5.0 * (r['off'] + r['hit']) - r['ds']
-
+    d = [p['score'] - b['score'] for _, p, b in pairs]
+    pol_to = sum(p['timeout'] for _, p, _ in pairs)
+    base_to = sum(b['timeout'] for _, _, b in pairs)
+    res_abs = st.mean(p['res_abs'] for _, p, _ in pairs)
     print()
-    print('%-10s %8s %6s %6s %10s %10s' %
-          ('', '진행 m', '이탈', '히트', '평균|잔차|', '비용(낮을수록)'))
-    for tag, r in (('정책', pol), ('잔차0', base)):
-        print('%-10s %8.2f %6d %6d %10.4f %10.2f'
-              % (tag, r['ds'], r['off'], r['hit'], r['res_abs'], cost(r)))
+    print('짝지은 평균차 %+.2f 초 (sd %.2f, n=%d) · 평균 |잔차| %.4f (범위 ±%.2f)'
+          % (st.mean(d), st.stdev(d) if len(d) > 1 else 0.0, len(d),
+             res_abs, RES_MAX))
+    print('타임아웃(150초 안전망): 정책 %d / 기준 %d' % (pol_to, base_to))
     print()
-    d_ds = pol['ds'] - base['ds']
-    d_pen = 5.0 * ((pol['off'] + pol['hit']) - (base['off'] + base['hit']))
-    print('진행량 차 %+.2f m · 페널티 차 %+.1f 초 · 순 %+.2f'
-          % (d_ds, d_pen, d_ds - d_pen))
-    print('평균 잔차 %+.4f m/s (범위 ±%.2f)' % (pol['res_mean'], RES_MAX))
-    print()
-    if d_ds - d_pen <= 0:
+    if pol_to > base_to:
+        print('=> 정책이 타임아웃을 더 낸다 — 즉시 원인부터. 공식 게이트 가지 마라.')
+    elif st.mean(d) >= 0:
         print('=> 잔차 0 보다 낫지 않다. 공식 게이트에 70분을 쓰기 전에 원인부터.')
     else:
         print('=> 트리아지 통과. 이제 eval_policy.py 로 공식 게이트를 재라.')

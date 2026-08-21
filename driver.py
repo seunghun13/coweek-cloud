@@ -277,6 +277,10 @@ class CoweekDriver(Node):
                     self.sharp_lock = False
                     self.last_steer = 0.0
                     self.last_arc = None
+                    # pure counter for the RL runner (nothing here reads
+                    # it): the runner must reset ITS history on the same
+                    # signature we reset ours
+                    self.teleport_n = getattr(self, 'teleport_n', 0) + 1
             self.prev_small = small
             self.frame = img
             self.frame_t = time.monotonic()
@@ -1081,6 +1085,7 @@ class CoweekDriver(Node):
             'ncone': len(self.cone_list),
             'band_px': int(self.band_px),
             'frame_t': self.frame_t,
+            'teleport_n': int(getattr(self, 'teleport_n', 0)),
         }
         self.pub_speed.publish(Float64(data=float(speed)))
         self.pub_steer.publish(Float64(data=float(steer)))
